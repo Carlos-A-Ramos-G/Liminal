@@ -33,26 +33,27 @@ mbar: true
 
 
 # -----------------------------------------------------------------------------
-# Ligands
+# Ligands  (single-pair mode only — not used by the network subcommands)
 # -----------------------------------------------------------------------------
-# Both ligands must be provided as PDB files with:
-#   • all hydrogens explicit
-#   • correct atom names (unique within each residue)
-#   • net charge is auto-detected via RDKit DetermineBonds, or set net_charge
-#     explicitly under system: (see below) to override
+# Both ligand PDB files must contain all hydrogens explicitly.
+# Net charge is auto-detected via RDKit DetermineBonds; override with
+# system.net_charge if needed.
 #
-# name: residue name used inside AMBER topology (max 4 characters, uppercase recommended)
+# name: AMBER residue name (≤ 4 characters, uppercase recommended).
+#       Optional — derived from the PDB filename stem if omitted.
+#       Example: structures/4a.pdb → L4A
+#
+# --skip-param: skip antechamber/parmchk2 and reuse existing files.
+#   Required layout (created automatically on a previous run):
+#     parameters/{name}/{name}.lib
+#     parameters/{name}/{name}.frcmod
 ligands:
   old:
-    pdb: structures/ING.pdb    # path relative to this config file
-    name: ING               # ≤ 4 characters
-#    lib:    parameters/ING/ING.lib      # optional — used with --skip-param
-#    frcmod: parameters/ING/ING.frcmod   # optional — used with --skip-param
+    pdb:  structures/LIG1.pdb   # path relative to this config file
+    # name: LIG1                 # optional — derived from filename if omitted
   new:
-    pdb: structures/INI.pdb
-    name: INI
-#    lib:    parameters/INI/INI.lib      # optional — used with --skip-param
-#    frcmod: parameters/INI/INI.frcmod   # optional — used with --skip-param
+    pdb:  structures/LIG2.pdb
+    # name: LIG2
 
 
 # -----------------------------------------------------------------------------

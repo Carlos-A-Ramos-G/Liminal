@@ -152,11 +152,11 @@ def validate_config(cfg: dict, require_ligands: bool = True) -> None:
         _req(cfg["ligands"], "old", "new", label="ligands")
         for side in ("old", "new"):
             lig = cfg["ligands"][side]
-            _req(lig, "pdb", "name", label=f"ligands.{side}")
+            _req(lig, "pdb", label=f"ligands.{side}")
             pdb = Path(lig["pdb"])
             if not pdb.exists():
                 sys.exit(f"Config error: ligands.{side}.pdb not found: {pdb}")
-            if len(lig["name"]) > 4:
+            if "name" in lig and len(lig["name"]) > 4:
                 sys.exit(
                     f"Config error: ligands.{side}.name must be ≤ 4 characters "
                     f"(AMBER limit); got '{lig['name']}'"
@@ -1381,10 +1381,10 @@ def prepare(cfg: dict, mode: str = "serial", dry_run: bool = False,
 
     old_cfg  = cfg["ligands"]["old"]
     new_cfg  = cfg["ligands"]["new"]
-    old_name = old_cfg["name"]
-    new_name = new_cfg["name"]
-    pdb_old = Path(old_cfg["pdb"])
-    pdb_new = Path(new_cfg["pdb"])
+    pdb_old  = Path(old_cfg["pdb"])
+    pdb_new  = Path(new_cfg["pdb"])
+    old_name = old_cfg.get("name") or _stem_to_resname(pdb_old)
+    new_name = new_cfg.get("name") or _stem_to_resname(pdb_new)
 
     mutation = f"{old_name}_to_{new_name}"
     prep_dir = Path(mutation) / "prep"
@@ -1410,13 +1410,17 @@ def prepare(cfg: dict, mode: str = "serial", dry_run: bool = False,
         return Path("parameters") / name
 
     if skip_param:
-        old_struct = Path(old_cfg["lib"])    if "lib"    in old_cfg else _param_dir(old_name) / f"{old_name}.lib"
-        old_frcmod = Path(old_cfg["frcmod"]) if "frcmod" in old_cfg else _param_dir(old_name) / f"{old_name}.frcmod"
-        new_struct = Path(new_cfg["lib"])    if "lib"    in new_cfg else _param_dir(new_name) / f"{new_name}.lib"
-        new_frcmod = Path(new_cfg["frcmod"]) if "frcmod" in new_cfg else _param_dir(new_name) / f"{new_name}.frcmod"
+        old_struct = _param_dir(old_name) / f"{old_name}.lib"
+        old_frcmod = _param_dir(old_name) / f"{old_name}.frcmod"
+        new_struct = _param_dir(new_name) / f"{new_name}.lib"
+        new_frcmod = _param_dir(new_name) / f"{new_name}.frcmod"
         for f in (old_struct, old_frcmod, new_struct, new_frcmod):
             if not f.exists():
-                sys.exit(f"  --skip-param requested but file not found: {f}")
+                sys.exit(
+                    f"  --skip-param: file not found: {f}\n"
+                    f"  Place GAFF2 parameter files under parameters/{{name}}/ "
+                    f"or omit --skip-param to run antechamber."
+                )
         print("  Skipping — using existing parameter files.")
     elif not dry_run:
         old_struct, old_frcmod = parameterize_ligand(pdb_old, old_name, cfg)
@@ -2332,29 +2336,134 @@ def prepare_network(
         print("  Network dry run complete — no files written.")
     else:
         print(f"  Network preparation complete: {n_edges} transformations ready.")
-        print(f"  Submit:  python rbfe_runner.py network-submit --mode {mode}")
+        print(f"  Submit:  python rbfe_runner.py network-submit"
+              f"  # branch-aware afterok chains (default)")
         print(f"  Analyse: python rbfe_runner.py network-analyse")
     print(f"{'═' * 62}\n")
 
 
-def submit_network(cfg: dict, mode: str = "serial") -> None:
-    """Submit all transformations recorded in network.json."""
+def submit_network(cfg: dict, mode: str = "branch") -> None:
+    """
+    Submit all transformations in network.json.
+
+    mode = "branch"   (default) — per-branch afterok chains.  Each edge waits
+                                   for its parent edge to complete; sibling
+                                   branches are fully independent.
+    mode = "parallel"            — submit every equil job immediately; no
+                                   SLURM dependencies between transformations.
+    mode = "local"               — run sequentially in the foreground (testing).
+    """
+    import subprocess as _sp
+    from collections import deque
+
     net_path = Path("network.json")
     if not net_path.exists():
         sys.exit("network.json not found — run 'network' first.")
     network = json.loads(net_path.read_text())
 
+    legs = ["unbound", "bound"] if "protein" in cfg else ["unbound"]
+
+    # ── Root the tree via BFS ─────────────────────────────────────────────────
+    adj: dict[str, list[str]] = {}
     for edge in network["edges"]:
-        mutation = f"{edge['old']}_to_{edge['new']}"
-        print(f"\n  ── {mutation} ──")
-        edge_cfg = {
-            **cfg,
-            "ligands": {
-                "old": {"pdb": edge["old_pdb"], "name": edge["old"]},
-                "new": {"pdb": edge["new_pdb"], "name": edge["new"]},
-            },
-        }
-        submit(edge_cfg, mode=mode)
+        adj.setdefault(edge["old"], []).append(edge["new"])
+        adj.setdefault(edge["new"], []).append(edge["old"])
+
+    root = min(network["ligands"], key=lambda x: x["n_heavy"])["name"]
+
+    parent: dict[str, str | None] = {root: None}
+    depth:  dict[str, int]        = {root: 0}
+    queue = deque([root])
+    while queue:
+        node = queue.popleft()
+        for nb in adj.get(node, []):
+            if nb not in parent:
+                parent[nb] = node
+                depth[nb]  = depth[node] + 1
+                queue.append(nb)
+
+    def _child(edge: dict) -> str:
+        """Return whichever endpoint is the child (deeper) node."""
+        return edge["new"] if parent.get(edge["new"]) == edge["old"] else edge["old"]
+
+    # Sort edges by wave = depth of child node so parents are always processed first
+    sorted_edges = sorted(network["edges"], key=lambda e: depth[_child(e)])
+
+    # ── Local mode ────────────────────────────────────────────────────────────
+    if mode == "local":
+        for edge in sorted_edges:
+            mutation = f"{edge['old']}_to_{edge['new']}"
+            print(f"\n  ── {mutation} ──")
+            submit(
+                {**cfg, "ligands": {
+                    "old": {"pdb": edge["old_pdb"], "name": edge["old"]},
+                    "new": {"pdb": edge["new_pdb"], "name": edge["new"]},
+                }},
+                mode="local",
+            )
+        return
+
+    # ── SLURM submission ──────────────────────────────────────────────────────
+    # node_jids[node] = equil job IDs submitted for the edge that *enters* node.
+    # The root has no entry edge; its children are submitted with no dependency.
+    node_jids: dict[str, list[int]] = {root: []}
+
+    # Group by wave for display
+    waves: dict[int, list[dict]] = {}
+    for edge in sorted_edges:
+        waves.setdefault(depth[_child(edge)], []).append(edge)
+
+    n_waves = max(waves) + 1
+    print(f"\n{'═' * 62}")
+    print(f"  Network submission — {len(network['edges'])} transformations, "
+          f"{n_waves} waves")
+    print(f"  Strategy : {'branch-aware afterok' if mode == 'branch' else 'all parallel'}")
+    print(f"{'═' * 62}")
+
+    for w in sorted(waves):
+        print(f"\n  Wave {w}:")
+        for edge in waves[w]:
+            old_n, new_n = edge["old"], edge["new"]
+            child    = _child(edge)
+            src      = parent[child]          # parent node in the rooted tree
+            mutation = f"{old_n}_to_{new_n}"
+
+            # Dependency: job IDs from the edge entering src (our parent edge)
+            dep_jids = node_jids.get(src, []) if mode == "branch" else []
+            dep_flag = (
+                ["--dependency", f"afterok:{':'.join(str(j) for j in dep_jids)}"]
+                if dep_jids else []
+            )
+
+            submitted: list[int] = []
+            for leg in legs:
+                leg_dir  = Path(mutation) / leg
+                cmd_file = leg_dir / "EQUILIBRATION.cmd"
+                if not cmd_file.exists():
+                    print(f"    [{leg}] EQUILIBRATION.cmd not found — skipping",
+                          file=sys.stderr)
+                    continue
+
+                res = _sp.run(
+                    ["sbatch"] + dep_flag + ["EQUILIBRATION.cmd"],
+                    capture_output=True, text=True, cwd=str(leg_dir),
+                )
+                if res.returncode == 0:
+                    jid = int(res.stdout.strip().split()[-1])
+                    submitted.append(jid)
+                    dep_str = (f" (afterok: {', '.join(str(j) for j in dep_jids)})"
+                               if dep_jids else "")
+                    print(f"    {mutation}/{leg} → job {jid}{dep_str}")
+                else:
+                    print(f"    {mutation}/{leg} — sbatch failed: "
+                          f"{res.stderr.strip()}", file=sys.stderr)
+
+            # Record these job IDs so child edges can depend on them
+            node_jids[child] = submitted
+
+    print(f"\n{'═' * 62}")
+    print(f"  All jobs submitted. Monitor with: squeue -u $USER")
+    print(f"{'═' * 62}\n")
 
 
 def analyse_network(cfg: dict, tail: int = 4000) -> None:
@@ -2469,8 +2578,16 @@ def main() -> None:
         "network-submit",
         help="Submit all jobs listed in network.json",
     )
-    p_netsub.add_argument("--mode", default="serial",
-                          choices=["serial", "parallel", "local"])
+    p_netsub.add_argument(
+        "--mode", default="branch",
+        choices=["branch", "parallel", "local"],
+        help=(
+            "branch (default): per-branch afterok chains — a failed edge halts "
+            "only its downstream branch; "
+            "parallel: submit all equil jobs immediately with no dependencies; "
+            "local: run sequentially in the foreground"
+        ),
+    )
 
     p_netana = sub.add_parser(
         "network-analyse",
