@@ -1,0 +1,185 @@
+TITLE     12a
+REMARK   4      COMPLIES WITH FORMAT V. 3.0, 1-DEC-2006
+REMARK 888
+REMARK 888 WRITTEN BY MAESTRO (A PRODUCT OF SCHRODINGER, LLC)
+HETATM    1  C1  INH     1      36.394  39.964  43.328  1.00  0.00           C  
+HETATM    2  O2  INH     1      36.870  40.784  44.116  1.00  0.00           O  
+HETATM    3  O3  INH     1      35.746  40.273  42.169  1.00  0.00           O  
+HETATM    4  C4  INH     1      35.762  41.606  41.710  1.00  0.00           C  
+HETATM    5  C5  INH     1      35.445  41.691  40.230  1.00  0.00           C  
+HETATM    6  C6  INH     1      36.267  41.027  39.295  1.00  0.00           C  
+HETATM    7  C7  INH     1      35.988  41.118  37.918  1.00  0.00           C  
+HETATM    8  C8  INH     1      34.887  41.874  37.469  1.00  0.00           C  
+HETATM    9  C9  INH     1      34.065  42.539  38.401  1.00  0.00           C  
+HETATM   10  C10 INH     1      34.344  42.449  39.779  1.00  0.00           C  
+HETATM   11  N18 INH     1      36.464  38.595  43.432  1.00  0.00           N  
+HETATM   12  C19 INH     1      37.446  37.898  44.257  1.00  0.00           C  
+HETATM   13  C20 INH     1      38.780  37.840  43.477  1.00  0.00           C  
+HETATM   14  O21 INH     1      38.829  38.196  42.297  1.00  0.00           O  
+HETATM   15  C22 INH     1      36.913  36.473  44.585  1.00  0.00           C  
+HETATM   16  C23 INH     1      35.679  36.544  45.502  1.00  0.00           C  
+HETATM   17  C24 INH     1      36.608  35.599  43.349  1.00  0.00           C  
+HETATM   18  N34 INH     1      39.858  37.404  44.133  1.00  0.00           N  
+HETATM   19  C35 INH     1      41.187  37.259  43.549  1.00  0.00           C  
+HETATM   20  C36 INH     1      41.910  36.097  44.226  1.00  0.00           C  
+HETATM   21  O37 INH     1      41.762  35.903  45.435  1.00  0.00           O  
+HETATM   22  C38 INH     1      41.963  38.583  43.653  1.00  0.00           C  
+HETATM   23  N44 INH     1      42.697  35.349  43.451  1.00  0.00           N  
+HETATM   24  C45 INH     1      43.444  34.142  43.811  1.00  0.00           C  
+HETATM   25  C46 INH     1      44.696  34.494  44.642  1.00  0.00           C  
+HETATM   26  O47 INH     1      45.826  34.615  44.156  1.00  0.00           O  
+HETATM   27  C48 INH     1      43.891  33.408  42.511  1.00  0.00           C  
+HETATM   28  C49 INH     1      42.792  33.230  41.466  1.00  0.00           C  
+HETATM   29  O50 INH     1      42.400  32.068  41.237  1.00  0.00           O  
+HETATM   30  O51 INH     1      42.354  34.280  40.940  1.00  0.00           O1-
+HETATM   31  C52 INH     1      44.494  34.778  46.136  1.00  0.00           C  
+HETATM   32  O53 INH     1      45.739  34.706  46.832  1.00  0.00           O  
+HETATM   33  N54 INH     1      45.657  35.400  48.044  1.00  0.00           N  
+HETATM   34  C55 INH     1      46.746  36.342  48.293  1.00  0.00           C  
+HETATM   35  C56 INH     1      46.586  36.619  49.810  1.00  0.00           C  
+HETATM   36  C57 INH     1      46.045  35.282  50.351  1.00  0.00           C  
+HETATM   37  C58 INH     1      45.360  34.680  49.134  1.00  0.00           C  
+HETATM   38  C59 INH     1      46.828  37.617  47.396  1.00  0.00           C  
+HETATM   39  C60 INH     1      45.571  37.745  50.114  1.00  0.00           C  
+HETATM   40  O61 INH     1      44.669  33.663  49.183  1.00  0.00           O  
+HETATM   41  C62 INH     1      46.865  37.265  45.884  1.00  0.00           C  
+HETATM   42  C79 INH     1      45.810  38.998  49.266  1.00  0.00           C  
+HETATM   43  C80 INH     1      45.743  38.643  47.775  1.00  0.00           C  
+HETATM   44  C81 INH     1      47.085  38.423  44.907  1.00  0.00           C  
+HETATM   45  O82 INH     1      48.245  38.330  44.245  1.00  0.00           O  
+HETATM   46  O83 INH     1      46.250  39.315  44.748  1.00  0.00           O  
+HETATM   47  C84 INH     1      48.473  39.224  43.169  1.00  0.00           C  
+HETATM   48  H11 INH     1      35.050  42.197  42.286  1.00  0.00           H  
+HETATM   49  H12 INH     1      36.749  42.047  41.864  1.00  0.00           H  
+HETATM   50  H13 INH     1      37.112  40.444  39.638  1.00  0.00           H  
+HETATM   51  H14 INH     1      36.620  40.606  37.206  1.00  0.00           H  
+HETATM   52  H15 INH     1      33.220  43.118  38.058  1.00  0.00           H  
+HETATM   53  H16 INH     1      33.713  42.961  40.490  1.00  0.00           H  
+HETATM   54  H17 INH     1      34.674  41.942  36.413  1.00  0.00           H  
+HETATM   55  H25 INH     1      36.123  38.101  42.623  1.00  0.00           H  
+HETATM   56  H26 INH     1      37.616  38.456  45.180  1.00  0.00           H  
+HETATM   57  H27 INH     1      37.689  35.957  45.152  1.00  0.00           H  
+HETATM   58  H28 INH     1      35.887  37.125  46.401  1.00  0.00           H  
+HETATM   59  H29 INH     1      34.831  37.012  44.998  1.00  0.00           H  
+HETATM   60  H30 INH     1      35.365  35.550  45.820  1.00  0.00           H  
+HETATM   61  H31 INH     1      35.817  36.026  42.732  1.00  0.00           H  
+HETATM   62  H32 INH     1      37.487  35.467  42.718  1.00  0.00           H  
+HETATM   63  H33 INH     1      36.285  34.603  43.650  1.00  0.00           H  
+HETATM   64  H39 INH     1      39.770  37.051  45.075  1.00  0.00           H  
+HETATM   65  H40 INH     1      41.081  37.000  42.492  1.00  0.00           H  
+HETATM   66  H41 INH     1      42.959  38.486  43.220  1.00  0.00           H  
+HETATM   67  H42 INH     1      41.447  39.383  43.122  1.00  0.00           H  
+HETATM   68  H43 INH     1      42.083  38.891  44.693  1.00  0.00           H  
+HETATM   69  H63 INH     1      42.597  35.451  42.438  1.00  0.00           H  
+HETATM   70  H64 INH     1      42.794  33.482  44.384  1.00  0.00           H  
+HETATM   71  H65 INH     1      44.684  33.959  42.005  1.00  0.00           H  
+HETATM   72  H66 INH     1      44.305  32.429  42.753  1.00  0.00           H  
+HETATM   73  H67 INH     1      44.078  35.781  46.229  1.00  0.00           H  
+HETATM   74  H68 INH     1      43.770  34.079  46.557  1.00  0.00           H  
+HETATM   75  H69 INH     1      47.674  35.785  48.143  1.00  0.00           H  
+HETATM   76  H70 INH     1      46.854  34.616  50.653  1.00  0.00           H  
+HETATM   77  H71 INH     1      45.356  35.399  51.189  1.00  0.00           H  
+HETATM   78  H72 INH     1      47.553  36.857  50.254  1.00  0.00           H  
+HETATM   79  H73 INH     1      47.788  38.084  47.624  1.00  0.00           H  
+HETATM   80  H74 INH     1      45.608  37.987  51.177  1.00  0.00           H  
+HETATM   81  H75 INH     1      44.553  37.400  49.924  1.00  0.00           H  
+HETATM   82  H76 INH     1      45.917  36.824  45.590  1.00  0.00           H  
+HETATM   83  H77 INH     1      47.633  36.506  45.711  1.00  0.00           H  
+HETATM   84  H85 INH     1      45.868  39.561  47.206  1.00  0.00           H  
+HETATM   85  H86 INH     1      44.758  38.254  47.515  1.00  0.00           H  
+HETATM   86  H87 INH     1      46.779  39.438  49.512  1.00  0.00           H  
+HETATM   87  H88 INH     1      45.058  39.755  49.494  1.00  0.00           H  
+HETATM   88  H89 INH     1      47.732  39.071  42.378  1.00  0.00           H  
+HETATM   89  H90 INH     1      48.410  40.263  43.493  1.00  0.00           H  
+HETATM   90  H91 INH     1      49.459  39.061  42.737  1.00  0.00           H  
+CONECT    1    2    3   11
+CONECT    2    1
+CONECT    3    1    4
+CONECT    4    3    5   48   49
+CONECT    5    4    6   10
+CONECT    6    5    7   50
+CONECT    7    6    8   51
+CONECT    8    7    9   54
+CONECT    9    8   10   52
+CONECT   10    5    9   53
+CONECT   48    4
+CONECT   49    4
+CONECT   50    6
+CONECT   51    7
+CONECT   52    9
+CONECT   53   10
+CONECT   54    8
+CONECT   11    1   12   55
+CONECT   12   11   13   15   56
+CONECT   13   12   14   18
+CONECT   14   13
+CONECT   15   12   16   17   57
+CONECT   16   15   58   59   60
+CONECT   17   15   61   62   63
+CONECT   55   11
+CONECT   56   12
+CONECT   57   15
+CONECT   58   16
+CONECT   59   16
+CONECT   60   16
+CONECT   61   17
+CONECT   62   17
+CONECT   63   17
+CONECT   18   13   19   64
+CONECT   19   18   20   22   65
+CONECT   20   19   21   23
+CONECT   21   20
+CONECT   22   19   66   67   68
+CONECT   64   18
+CONECT   65   19
+CONECT   66   22
+CONECT   67   22
+CONECT   68   22
+CONECT   23   20   24   69
+CONECT   24   23   25   27   70
+CONECT   25   24   26   31
+CONECT   26   25
+CONECT   27   24   28   71   72
+CONECT   28   27   29   30
+CONECT   29   28
+CONECT   30   28
+CONECT   31   25   32   73   74
+CONECT   32   31   33
+CONECT   33   32   34   37
+CONECT   34   33   35   38   75
+CONECT   35   34   36   39   78
+CONECT   36   35   37   76   77
+CONECT   37   33   36   40
+CONECT   38   34   41   79   43
+CONECT   39   35   80   81   42
+CONECT   40   37
+CONECT   41   38   82   83   44
+CONECT   69   23
+CONECT   70   24
+CONECT   71   27
+CONECT   72   27
+CONECT   73   31
+CONECT   74   31
+CONECT   75   34
+CONECT   76   36
+CONECT   77   36
+CONECT   78   35
+CONECT   79   38
+CONECT   80   39
+CONECT   81   39
+CONECT   82   41
+CONECT   83   41
+CONECT   42   39   43   86   87
+CONECT   43   38   42   84   85
+CONECT   44   41   45   46
+CONECT   45   44   47
+CONECT   46   44
+CONECT   47   45   88   89   90
+CONECT   84   43
+CONECT   85   43
+CONECT   86   42
+CONECT   87   42
+CONECT   88   47
+CONECT   89   47
+CONECT   90   47
+END   
