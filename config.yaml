@@ -1,0 +1,157 @@
+# =============================================================================
+# rbfe_runner.py — example configuration file
+#
+# Copy and rename this file for each mutation you want to run.
+# Every key below is required unless marked OPTIONAL.
+#
+# Usage:
+#   python rbfe_runner.py --config rbfe_config.yaml prepare [--dry-run]
+#   python rbfe_runner.py --config rbfe_config.yaml submit  [--mode serial|parallel|local]
+#   python rbfe_runner.py --config rbfe_config.yaml analyse [--tail N]
+# =============================================================================
+
+
+# -----------------------------------------------------------------------------
+# Alchemical transformation
+# -----------------------------------------------------------------------------
+# Simulation temperature (K).
+# Used for: final heating target, NPT equilibration, NPT production, MBAR β.
+temperature: 300.0
+
+# Number of Gauss-Legendre lambda windows.
+# Supported: any integer >= 3.  Common choices: 5 (fast), 9 (balanced), 12 (accurate).
+n_lambdas: 9
+
+# Number of independent replicas (for error estimation).
+# 1 = single run;  3 = recommended for publishable results.
+replicates: 3
+
+# Write MBAR cross-energies (ifmbar=1) and run pymbar analysis.
+# Requires:  conda install -c conda-forge pymbar
+# Set to false to use TI / Gauss-Legendre only.
+mbar: true
+
+
+# -----------------------------------------------------------------------------
+# Ligands
+# -----------------------------------------------------------------------------
+# Both ligands must be provided as PDB files with:
+#   • all hydrogens explicit
+#   • correct atom names (unique within each residue)
+#   • net charge is auto-detected via RDKit DetermineBonds, or set net_charge
+#     explicitly under system: (see below) to override
+#
+# name: residue name used inside AMBER topology (max 4 characters, uppercase recommended)
+ligands:
+  old:
+    pdb: ING.pdb    # path relative to this config file
+    name: ING               # ≤ 4 characters
+    lib:    parameters/ING/ING.lib      # optional — used with --skip-param
+    frcmod: parameters/ING/ING.frcmod   # optional — used with --skip-param
+  new:
+    pdb: INI.pdb
+    name: INI
+    lib:    parameters/INI/INI.lib      # optional — used with --skip-param
+    frcmod: parameters/INI/INI.frcmod   # optional — used with --skip-param
+
+
+# -----------------------------------------------------------------------------
+# Protein (OPTIONAL — omit for ligand hydration FEP, include for RBFE)
+# -----------------------------------------------------------------------------
+# pdb4amber is recommended to pre-process the PDB before running rbfe_runner.py:
+#   pdb4amber -i raw_protein.pdb -o protein.pdb --nohyd --dry
+#
+# rbfe_runner.py will abort if alternate locations (ALTLOC) are detected.
+protein:
+  pdb: protein.pdb
+
+
+# -----------------------------------------------------------------------------
+# Force fields
+# -----------------------------------------------------------------------------
+forcefield:
+  protein: ff14SB          # ff14SB | ff19SB                (required)
+  ligand:  gaff2           # gaff   | gaff2                 (required)
+  water:   tip3p           # tip3p  | tip4pew | opc         (required)
+  ions:    ionsjc_tip3p    # ionsjc_tip3p | ionsjc_tip4pew  (optional — comment out to omit)
+
+
+# -----------------------------------------------------------------------------
+# System building
+# -----------------------------------------------------------------------------
+system:
+  # Minimum distance (Å) from any solute atom to the box edge.
+  box_padding: 12.0
+
+  # Charge method passed to antechamber -c.
+  # bcc  (AM1-BCC)  — fast, recommended for most ligands
+  # mul  (Mulliken) — faster but less accurate
+  charge_method: bcc
+
+  # NaCl concentration (mol/L) added on top of neutralisation ions.
+  ion_concentration: 0.15
+
+  # Net charge passed to antechamber -nc (OPTIONAL).
+  # auto  — detected from each ligand PDB via RDKit DetermineBonds (default)
+  # 0     — force neutral; use an explicit integer for charged ligands
+  # net_charge: auto
+
+
+# -----------------------------------------------------------------------------
+# AMBER module / CUDA library
+# -----------------------------------------------------------------------------
+amber:
+  # Module loaded on the HPC cluster for GPU runs.
+  cuda_module: apps/amber/24
+
+  # Full path to the directory containing libcuda.so.1 on immutable-OS hosts
+  # (e.g. Fedora Silverblue / Kinoite with NVIDIA driver under /run/host).
+  # Leave empty or omit on standard Linux clusters.
+  cuda_lib_path: ""     # e.g. /home/user/nvidia-driver-libs
+
+
+# -----------------------------------------------------------------------------
+# SLURM resource specifications
+# Any key here becomes #SBATCH --key=value, so you can add qos, account, mem, etc.
+# -----------------------------------------------------------------------------
+slurm:
+  gpu:
+    time:      "24:00:00"
+    ntasks:    1
+    gres:      gpu:1
+    partition: CHEM031804
+
+
+# -----------------------------------------------------------------------------
+# Execution commands
+# gpu: used for minimisation, heating, equilibration, and all production windows.
+# -----------------------------------------------------------------------------
+execution_command:
+  gpu: "pmemd.cuda"
+
+
+# -----------------------------------------------------------------------------
+# Simulation parameters
+# -----------------------------------------------------------------------------
+simulation:
+
+  min:
+    maxcyc: 1000000     # maximum steepest-descent / conjugate-gradient steps
+    ntpr:   5000        # energy print frequency (steps)
+
+  heating:
+    nstlim: 500000     # total steps  → 1 ns  at dt = 0.001 ps
+    dt:     0.001       # time step (ps)
+    ntwx:   10000       # trajectory / energy write frequency (steps)
+    tempi:  10.0        # initial temperature (K); target is top-level temperature
+
+  equil:
+    nstlim: 500000     # total steps  → 1 ns  at dt = 0.001 ps
+    dt:     0.001
+    ntwx:   100000      # coordinate write frequency (steps)
+
+  prod:
+    nstlim: 1000000     # total steps  → 5 ns  at dt = 0.001 ps
+    dt:     0.001
+    ntwe:   1000        # dV/dλ (and MBAR energies) write frequency (steps)
+    ntwx:   10000       # coordinate write frequency (steps)

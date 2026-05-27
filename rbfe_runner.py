@@ -1,0 +1,1597 @@
+#!/usr/bin/env python3
+"""
+rbfe_runner.py — AmberTools-native Relative Binding Free Energy workflow.
+
+Automates the full RBFE pipeline starting from raw ligand mol2 files and a
+protein PDB, eliminating all manual atom-mask specification.
+
+Pipeline
+--------
+  prepare   Parameterise ligands (antechamber + parmchk2), find the optimal
+            atom mapping (FE-aware MCS), build solvated dual-residue AMBER
+            systems (tleap), derive TI masks automatically (parmed), and
+            write all production AMBER input files.
+  submit    Submit the generated SLURM / local job scripts.
+  analyse   Compute ΔΔG via TI (Gauss-Legendre quadrature) and, when
+            mbar: true, via MBAR (pymbar >= 4).
+
+What makes this less error-prone than manual setup
+---------------------------------------------------
+  * timask1/2 and scmask1/2 are derived automatically from a scored MCS that
+    penalises element changes, ring/non-ring switches, and charge changes —
+    not just raw atom count.
+  * Net charge change (ΔQ ≠ 0) is detected and reported before any
+    simulation files are written.
+  * parmchk2 ATTN warnings abort the run; partial parameter sets never reach
+    the cluster.
+  * The atom mapping is written to prep/mapping.json for user inspection and
+    optional manual override before production inputs are generated.
+  * The protein PDB is screened for alternate locations and non-standard
+    residues before tleap is invoked.
+
+Environment (AmberTools25 conda env)
+-------------------------------------
+  conda activate AmberTools25
+  conda install -c conda-forge rdkit pymbar pyyaml
+
+Usage
+-----
+  python rbfe_runner.py prepare [--dry-run]
+  python rbfe_runner.py submit  [--mode serial|parallel|local]
+  python rbfe_runner.py analyse [--tail N]
+  python rbfe_runner.py --config my_config.yaml prepare
+"""
+
+import argparse
+import json
+import re
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+import numpy as np
+
+try:
+    import yaml
+except ImportError:
+    sys.exit("PyYAML required:  conda install -c conda-forge pyyaml")
+
+
+# =============================================================================
+# Gauss-Legendre quadrature
+# =============================================================================
+
+def compute_gl_quadrature(n: int) -> tuple[np.ndarray, np.ndarray]:
+    """GL nodes on [0, 1] and weights summing to 1."""
+    nodes, weights = np.polynomial.legendre.leggauss(n)
+    return (nodes + 1) / 2, weights / 2
+
+
+def _middle(n: int) -> int:
+    return (n + 1) // 2
+
+
+# =============================================================================
+# MBAR helpers
+# =============================================================================
+
+_KB_KCAL: float = 0.001987204258   # kcal mol⁻¹ K⁻¹
+
+
+def _mbar_beta(temp: float) -> float:
+    """β = 1/(k_B T) in mol kcal⁻¹.  Temperature from config."""
+    return 1.0 / (_KB_KCAL * temp)
+
+
+def _format_mbar_block(lambdas: np.ndarray) -> str:
+    """
+    AMBER &cntrl fragment for ifmbar=1.
+
+    Adds λ=0 and λ=1 as unsampled endpoint states (N_k = 0 for those rows)
+    so pymbar.MBAR spans the full alchemical interval.
+    """
+    all_lam = np.concatenate([[0.0], lambdas, [1.0]])
+    lam_str = ", ".join(f"{l:.5f}" for l in all_lam)
+    return (
+        f"\n   ifmbar = 1, mbar_states = {len(all_lam)},"
+        f"\n   mbar_lambda = {lam_str},"
+    )
+
+
+# =============================================================================
+# Environment check
+# =============================================================================
+
+def check_environment() -> None:
+    """Verify required tools and Python packages are reachable. Exit clearly."""
+    missing: list[str] = []
+    for tool in ("antechamber", "parmchk2", "tleap"):
+        if not shutil.which(tool):
+            missing.append(f"  {tool:<14} → activate the AmberTools25 conda env")
+    for pkg, install in (("rdkit", "rdkit"), ("yaml", "pyyaml")):
+        try:
+            __import__(pkg)
+        except ImportError:
+            missing.append(
+                f"  {pkg:<14} → conda install -c conda-forge {install}"
+            )
+    if missing:
+        sys.exit(
+            "Missing dependencies — run inside 'conda activate AmberTools25':\n"
+            + "\n".join(missing)
+        )
+
+
+# =============================================================================
+# Config validation
+# =============================================================================
+
+def validate_config(cfg: dict) -> None:
+    """Raise SystemExit with a precise message on the first config error."""
+
+    def _req(d: dict, *keys: str, label: str = "config") -> None:
+        for k in keys:
+            if k not in d:
+                sys.exit(f"Config error: '{label}' is missing required key '{k}'")
+
+    _req(cfg, "temperature", "n_lambdas", "replicates",
+         "ligands", "forcefield", "system", "simulation", "amber", "slurm")
+
+    if cfg["n_lambdas"] < 3:
+        sys.exit("Config error: n_lambdas must be >= 3")
+    if cfg["temperature"] <= 0:
+        sys.exit("Config error: temperature must be > 0 K")
+    if cfg["replicates"] < 1:
+        sys.exit("Config error: replicates must be >= 1")
+
+    _req(cfg["ligands"], "old", "new", label="ligands")
+    for side in ("old", "new"):
+        lig = cfg["ligands"][side]
+        _req(lig, "pdb", "name", label=f"ligands.{side}")
+        pdb = Path(lig["pdb"])
+        if not pdb.exists():
+            sys.exit(f"Config error: ligands.{side}.pdb not found: {pdb}")
+        if len(lig["name"]) > 4:
+            sys.exit(
+                f"Config error: ligands.{side}.name must be ≤ 4 characters "
+                f"(AMBER limit); got '{lig['name']}'"
+            )
+
+    if "protein" in cfg:
+        pdb = Path(cfg["protein"]["pdb"])
+        if not pdb.exists():
+            sys.exit(f"Config error: protein.pdb not found: {pdb}")
+
+    _req(cfg["forcefield"], "protein", "ligand", "water",
+         label="forcefield")
+    _req(cfg["system"], "box_padding", "charge_method", "ion_concentration",
+         label="system")
+
+    valid_gaff  = {"gaff", "gaff2"}
+    valid_water = {"tip3p", "tip4pew", "opc"}
+    ff = cfg["forcefield"]
+    if ff["ligand"] not in valid_gaff:
+        sys.exit(f"Config error: forcefield.ligand must be one of {valid_gaff}")
+    if ff["water"].lower() not in valid_water:
+        sys.exit(f"Config error: forcefield.water must be one of {valid_water}")
+
+    for stage in ("min", "heating", "equil", "prod"):
+        if stage not in cfg["simulation"]:
+            sys.exit(f"Config error: simulation.{stage} section is missing")
+
+
+# =============================================================================
+# Subprocess helpers
+# =============================================================================
+
+def _run(cmd: list, cwd: Path | None = None, desc: str = "") -> str:
+    """Run a subprocess, print what was run, return stdout.  Exit on failure."""
+    label = desc or Path(cmd[0]).name
+    print(f"    → {label}: {' '.join(str(c) for c in cmd)}")
+    res = subprocess.run(
+        [str(c) for c in cmd],
+        cwd=str(cwd) if cwd else None,
+        capture_output=True, text=True,
+    )
+    if res.returncode != 0:
+        sys.exit(
+            f"\nERROR: {label} failed (exit {res.returncode})\n"
+            f"stdout (last 40 lines):\n"
+            + "\n".join((res.stdout or "").splitlines()[-40:])
+            + "\nstderr:\n"
+            + "\n".join((res.stderr or "").splitlines()[-20:])
+        )
+    return res.stdout
+
+
+def _check_frcmod(frcmod: Path) -> None:
+    """Abort if parmchk2 produced any ATTN (missing parameter) lines."""
+    attn = [l for l in frcmod.read_text().splitlines() if "ATTN" in l]
+    if attn:
+        sys.exit(
+            f"parmchk2 found missing parameters in {frcmod}:\n"
+            + "\n".join(f"  {l}" for l in attn)
+            + "\n\nAdd a custom frcmod for these terms or choose a different "
+              "forcefield / charge method."
+        )
+
+
+# =============================================================================
+# Ligand parameterisation
+# =============================================================================
+
+def _infer_net_charge(pdb_path: Path) -> int:
+    """Infer net formal charge from a ligand PDB using RDKit.
+
+    Tries candidate total charges until DetermineBonds produces a self-consistent
+    assignment. Raises RuntimeError if none converge (bad geometry or missing H).
+    """
+    try:
+        from rdkit import Chem
+        from rdkit.Chem import rdDetermineBonds
+    except ImportError:
+        sys.exit("rdkit required:  conda install -c conda-forge rdkit")
+    mol = Chem.MolFromPDBFile(str(pdb_path), removeHs=False, sanitize=False)
+    if mol is None:
+        raise RuntimeError(f"RDKit could not parse {pdb_path}")
+    for charge in [0, -1, 1, -2, 2, -3, 3]:
+        try:
+            mol_try = Chem.RWMol(Chem.Mol(mol))
+            rdDetermineBonds.DetermineBonds(mol_try, charge=charge)
+            Chem.SanitizeMol(mol_try)
+            if Chem.GetFormalCharge(mol_try) == charge:
+                return charge
+        except Exception:
+            continue
+    raise RuntimeError(
+        f"Could not determine net charge for {pdb_path.name}. "
+        "Check that the PDB contains all hydrogens and has correct geometry, "
+        "or set net_charge to an explicit integer in config.yaml."
+    )
+
+
+def _resolve_charge(pdb_path: Path, cfg: dict) -> int:
+    raw = cfg["system"].get("net_charge", "auto")
+    if str(raw).lower() == "auto":
+        return _infer_net_charge(pdb_path)
+    return int(raw)
+
+
+def parameterize_ligand(
+    pdb: Path, resname: str, cfg: dict,
+) -> tuple[Path, Path]:
+    """
+    Run antechamber → parmchk2 → tleap for one ligand.
+
+    Outputs are written to parameters/{resname}/:
+        {resname}.mol2    GAFF atom types + AM1-BCC charges
+        {resname}.frcmod  missing GAFF parameters
+        {resname}.lib     AMBER off-library file
+
+    Returns (lib, frcmod).  Aborts on any parmchk2 ATTN warning.
+    """
+    work_dir = Path("parameters") / resname
+    work_dir.mkdir(parents=True, exist_ok=True)
+    gaff   = cfg["forcefield"]["ligand"]        # gaff | gaff2
+    method = cfg["system"]["charge_method"]     # bcc  | mul
+    mult   = cfg["system"].get("multiplicity", 1)
+    charge = _resolve_charge(pdb, cfg)
+
+    out_mol2 = work_dir / f"{resname}.mol2"
+    frcmod   = work_dir / f"{resname}.frcmod"
+    lib      = work_dir / f"{resname}.lib"
+
+    _run(
+        ["antechamber",
+         "-i",  str(pdb.resolve()), "-fi", "pdb",
+         "-o",  str(out_mol2),      "-fo", "mol2",
+         "-c",  method, "-s", "2",
+         "-nc", str(charge), "-m", str(mult),
+         "-rn", resname, "-at", gaff],
+        cwd=work_dir,
+        desc=f"antechamber ({resname})",
+    )
+    _run(
+        ["parmchk2",
+         "-i", str(out_mol2), "-f", "mol2",
+         "-o", str(frcmod), "-s", gaff],
+        cwd=work_dir,
+        desc=f"parmchk2 ({resname})",
+    )
+    _check_frcmod(frcmod)
+
+    tleap_in = work_dir / "tleap_lib.in"
+    tleap_in.write_text(
+        f"source {_FF_SOURCES.get(gaff, 'leaprc.' + gaff)}\n"
+        f"{resname} = loadmol2 {out_mol2.resolve()}\n"
+        f"check {resname}\n"
+        f"loadamberparams {frcmod.resolve()}\n"
+        f"saveoff {resname} {lib.resolve()}\n"
+        "quit\n"
+    )
+    _run(["tleap", "-f", str(tleap_in.resolve())], cwd=work_dir,
+         desc=f"tleap lib ({resname})")
+
+    if not lib.exists():
+        sys.exit(f"tleap did not produce {lib} — check {work_dir}/leap.log")
+
+    return lib, frcmod
+
+
+# =============================================================================
+# FE-aware atom mapping
+# =============================================================================
+
+def _atom_names_from_mol(mol) -> dict[int, str]:
+    """Return {rdkit_atom_idx: tripos_atom_name} preserving mol2 names."""
+    names: dict[int, str] = {}
+    for atom in mol.GetAtoms():
+        mi = atom.GetMonomerInfo()
+        names[atom.GetIdx()] = mi.GetName().strip() if mi else f"X{atom.GetIdx()}"
+    return names
+
+
+def _fe_score(mol_old, mol_new,
+              match_old: tuple[int, ...],
+              match_new: tuple[int, ...]) -> float:
+    """
+    Score an atom-atom mapping for free energy suitability.
+
+    Lower = better.  Penalties:
+      +10 per pair with different atomic numbers
+      + 5 per pair where ring membership differs
+      + 3 per pair with different formal charges
+      + 1 per unmatched atom on either side
+    """
+    score = 0.0
+    ri_old = mol_old.GetRingInfo()
+    ri_new = mol_new.GetRingInfo()
+    for io, in_ in zip(match_old, match_new):
+        ao = mol_old.GetAtomWithIdx(io)
+        an = mol_new.GetAtomWithIdx(in_)
+        if ao.GetAtomicNum() != an.GetAtomicNum():
+            score += 10
+        in_ring_old = ri_old.NumAtomRings(io) > 0
+        in_ring_new = ri_new.NumAtomRings(in_) > 0
+        if in_ring_old != in_ring_new:
+            score += 5
+        if ao.GetFormalCharge() != an.GetFormalCharge():
+            score += 3
+    score += (mol_old.GetNumAtoms() - len(match_old) +
+              mol_new.GetNumAtoms() - len(match_new))
+    return score
+
+
+def compute_fe_mapping(pdb_old: Path, pdb_new: Path) -> dict:
+    """
+    Find the FE-optimal atom mapping between two ligands.
+
+    Algorithm
+    ---------
+    1. Load both PDB files with RDKit (keep explicit H); assign bond orders
+       via DetermineBonds using the auto-detected net charge.
+    2. Strip H and run FindMCS on heavy atoms with ring-consistent constraints.
+    3. Score *all* MCS matches on both molecules; pick the lowest-penalty pair.
+    4. Extend the heavy-atom assignment to bonded hydrogens.
+
+    Returns
+    -------
+    dict with keys:
+        matched_old   atom names (old mol) in the common core
+        matched_new   atom names (new mol, same ordering as matched_old)
+        unique_old    names unique to old ligand → will be soft-core (scmask1)
+        unique_new    names unique to new ligand → will be soft-core (scmask2)
+        score         float penalty (lower = better mapping)
+        n_common_heavy int
+    """
+    try:
+        from rdkit import Chem
+        from rdkit.Chem import rdFMCS, rdDetermineBonds
+    except ImportError:
+        sys.exit("rdkit required:  conda install -c conda-forge rdkit")
+
+    def _load(pdb: Path):
+        mol = Chem.MolFromPDBFile(str(pdb), removeHs=False, sanitize=False)
+        if mol is None:
+            sys.exit(f"RDKit could not parse {pdb} — check the PDB format.")
+        charge = _infer_net_charge(pdb)
+        rdDetermineBonds.DetermineBonds(mol, charge=charge)
+        Chem.SanitizeMol(mol)
+        return mol
+
+    mol_old_h = _load(pdb_old)
+    mol_new_h = _load(pdb_new)
+
+    names_old_h = _atom_names_from_mol(mol_old_h)
+    names_new_h = _atom_names_from_mol(mol_new_h)
+
+    mol_old = Chem.RemoveHs(mol_old_h)
+    mol_new = Chem.RemoveHs(mol_new_h)
+    names_old = _atom_names_from_mol(mol_old)
+    names_new = _atom_names_from_mol(mol_new)
+
+    mcs = rdFMCS.FindMCS(
+        [mol_old, mol_new],
+        atomCompare=rdFMCS.AtomCompare.CompareElements,
+        bondCompare=rdFMCS.BondCompare.CompareOrder,
+        ringMatchesRingOnly=True,
+        completeRingsOnly=True,
+        timeout=60,
+    )
+
+    # No common substructure — all atoms soft-core (valid but slow to converge)
+    if mcs.numAtoms == 0:
+        print("  WARNING: no common heavy-atom substructure found.")
+        print("           All atoms will be soft-core. Convergence may be slow.")
+        return {
+            "matched_old": [],
+            "matched_new": [],
+            "unique_old": list(names_old_h.values()),
+            "unique_new": list(names_new_h.values()),
+            "score": float("inf"),
+            "n_common_heavy": 0,
+        }
+
+    query = Chem.MolFromSmarts(mcs.smartsString)
+    matches_old = mol_old.GetSubstructMatches(query, uniquify=False)
+    matches_new = mol_new.GetSubstructMatches(query, uniquify=False)
+
+    best_score = float("inf")
+    best_io: tuple = matches_old[0]
+    best_in: tuple = matches_new[0]
+    for mo in matches_old:
+        for mn in matches_new:
+            s = _fe_score(mol_old, mol_new, mo, mn)
+            if s < best_score:
+                best_score, best_io, best_in = s, mo, mn
+
+    # Build {heavy_atom_name: [H_neighbor_names]} for each molecule ----------
+    def _h_neighbors(mol_h, names_h: dict) -> dict[str, list[str]]:
+        result: dict[str, list[str]] = {}
+        for idx, name in names_h.items():
+            if mol_h.GetAtomWithIdx(idx).GetAtomicNum() == 1:
+                continue
+            result[name] = [
+                names_h[n.GetIdx()]
+                for n in mol_h.GetAtomWithIdx(idx).GetNeighbors()
+                if n.GetAtomicNum() == 1
+            ]
+        return result
+
+    h_nbrs_old = _h_neighbors(mol_old_h, names_old_h)
+    h_nbrs_new = _h_neighbors(mol_new_h, names_new_h)
+
+    matched_old: list[str] = []
+    matched_new: list[str] = []
+    unique_old:  list[str] = []
+    unique_new:  list[str] = []
+
+    # Matched heavy-atom pairs: compare H counts per pair.
+    # Excess H on either side go to that side's unique list — this correctly
+    # handles fused-ring cases (e.g. benzene→naphthalene) where a matched
+    # carbon loses its H upon becoming a ring-junction atom.
+    for io, in_ in zip(best_io, best_in):
+        old_name = names_old[io]
+        new_name = names_new[in_]
+        matched_old.append(old_name)
+        matched_new.append(new_name)
+
+        old_hs = h_nbrs_old.get(old_name, [])
+        new_hs = h_nbrs_new.get(new_name, [])
+        n = min(len(old_hs), len(new_hs))
+        matched_old.extend(old_hs[:n])
+        matched_new.extend(new_hs[:n])
+        unique_old.extend(old_hs[n:])
+        unique_new.extend(new_hs[n:])
+
+    # Unique heavy atoms and all their hydrogens
+    matched_old_heavy = {names_old[i] for i in best_io}
+    matched_new_heavy = {names_new[i] for i in best_in}
+
+    for idx, name in names_old.items():
+        if name not in matched_old_heavy:
+            unique_old.append(name)
+            unique_old.extend(h_nbrs_old.get(name, []))
+
+    for idx, name in names_new.items():
+        if name not in matched_new_heavy:
+            unique_new.append(name)
+            unique_new.extend(h_nbrs_new.get(name, []))
+
+    return {
+        "matched_old":    matched_old,
+        "matched_new":    matched_new,
+        "unique_old":     unique_old,
+        "unique_new":     unique_new,
+        "score":          best_score,
+        "n_common_heavy": len(best_io),
+    }
+
+
+# =============================================================================
+# Net charge detection
+# =============================================================================
+
+def detect_formal_charges(pdb_old: Path, pdb_new: Path) -> tuple[int, int]:
+    """Return (q_old, q_new) formal charges from PDB files via RDKit."""
+    return _infer_net_charge(pdb_old), _infer_net_charge(pdb_new)
+
+
+# =============================================================================
+# PDB pre-flight check
+# =============================================================================
+
+def check_pdb(pdb: Path) -> None:
+    """Screen a protein PDB for issues that cause silent tleap failures."""
+    text = pdb.read_text()
+
+    if re.search(r"^(?:ATOM|HETATM).{10}[AB] ", text, re.MULTILINE):
+        print(
+            f"  NOTE [{pdb.name}]: alternate locations (ALTLOC) detected.\n"
+            "  tleap will use whichever conformation appears first in the file.\n"
+            "  If this causes issues, clean with: "
+            "pdb4amber -i protein.pdb -o protein_clean.pdb"
+        )
+
+    known_het = {"HOH", "WAT", "CL", "NA", "K", "MG", "CA", "ZN", "MN", "FE"}
+    lig_names = {cfg_lig_name for cfg_lig_name in []}   # populated later in prepare()
+    non_std = (
+        set(re.findall(r"^HETATM.{8}(\S+)", text, re.MULTILINE)) - known_het
+    )
+    if non_std:
+        print(
+            f"  NOTE [{pdb.name}]: non-standard HETATM residues found: "
+            f"{', '.join(sorted(non_std))}\n"
+            "  These are fine if they are your TI ligands; otherwise they need "
+            "separate parameterisation."
+        )
+
+
+
+# =============================================================================
+# tleap system building
+# =============================================================================
+
+_FF_SOURCES: dict[str, str] = {
+    "ff14SB":         "leaprc.protein.ff14SB",
+    "ff19SB":         "leaprc.protein.ff19SB",
+    "gaff":           "leaprc.gaff",
+    "gaff2":          "leaprc.gaff2",
+    "tip3p":          "leaprc.water.tip3p",
+    "tip4pew":        "leaprc.water.tip4pew",
+    "opc":            "leaprc.water.opc",
+    "ionsjc_tip3p":   "leaprc.water.ionsjc_tip3p",
+    "ionsjc_tip4pew": "leaprc.water.ionsjc_tip4pew",
+}
+
+_BOX_NAME: dict[str, str] = {
+    "tip3p":  "TIP3PBOX",
+    "tip4pew":"TIP4PEWBOX",
+    "opc":    "OPCBOX",
+}
+
+
+def _estimate_ion_counts(total_solute_charge: int,
+                         conc_M: float,
+                         padding: float) -> tuple[int, int]:
+    """
+    Return (n_Na, n_Cl) for charge neutralisation + physiological NaCl.
+
+    Water count is estimated from box volume assuming ~30 Å³/water and a
+    cubic box with edge ≈ 2 * padding + 50 Å (generous for most complexes).
+    The salt count is rounded to the nearest integer.
+    """
+    edge_A   = 2 * padding + 50.0
+    vol_L    = (edge_A * 1e-10) ** 3 * 1e3          # m³ → L
+    n_salt   = max(0, round(conc_M * 6.022e23 * vol_L))
+
+    if total_solute_charge < 0:
+        n_Na = -total_solute_charge + n_salt
+        n_Cl = n_salt
+    elif total_solute_charge > 0:
+        n_Na = n_salt
+        n_Cl = total_solute_charge + n_salt
+    else:
+        n_Na = n_Cl = n_salt
+
+    return n_Na, n_Cl
+
+
+def _ff_source(key: str, val: str) -> str:
+    """Return the full leaprc name for a forcefield key/value pair."""
+    if val in _FF_SOURCES:
+        return _FF_SOURCES[val]
+    if key == "protein":
+        return f"leaprc.protein.{val}"
+    if key == "water":
+        return f"leaprc.water.{val}"
+    return f"leaprc.{val}"
+
+
+def _tleap_load(resname: str, path: Path) -> str:
+    """Return the tleap load line for a mol2 or lib file."""
+    if path.suffix == ".lib":
+        return f"loadOff {path.resolve()}"
+    return f"{resname} = loadMol2 {path.resolve()}"
+
+
+def build_system(
+    leg: str,
+    lig_old_struct: Path, lig_old_frcmod: Path,
+    lig_new_struct: Path, lig_new_frcmod: Path,
+    old_resname: str, new_resname: str,
+    q_old: int, q_new: int,
+    cfg: dict, work_dir: Path,
+) -> tuple[Path, Path]:
+    """
+    Write and execute a tleap script to build the solvated dual-residue system.
+
+    leg : 'unbound'  — two ligands in water only
+          'bound'    — protein + two ligands in water
+
+    Both ligands are loaded as separate residues so AMBER TI can use
+    timask1/timask2 to select them independently.
+
+    Net charge change (ΔQ ≠ 0)
+    ---------------------------
+    Both ligand charges contribute to the combined topology charge.  tleap's
+    addions command neutralises this sum.  When ΔQ ≠ 0 the neutralisation
+    ion count differs between λ=0 and λ=1; this introduces a small systematic
+    bias (same as FESetup's default behaviour).  For rigorous ΔQ ≠ 0 handling,
+    build separate topologies for each endpoint — see AMBER TI tutorial 3.
+
+    Returns (parm7_path, rst7_path).
+    """
+    work_dir.mkdir(parents=True, exist_ok=True)
+
+    ff      = cfg["forcefield"]
+    sys_cfg = cfg["system"]
+    padding = float(sys_cfg["box_padding"])
+    conc    = float(sys_cfg["ion_concentration"])
+    water   = ff["water"].lower()
+    box     = _BOX_NAME.get(water, "TIP3PBOX")
+
+    # Both ligands are present simultaneously → sum their charges
+    combined_charge = q_old + q_new
+    n_Na, n_Cl = _estimate_ion_counts(combined_charge, conc, padding)
+
+    sources = [
+        f"source {_ff_source(key, val)}"
+        for key in ("protein", "ligand", "water", "ions")
+        for val in [ff.get(key)]
+        if val
+    ]
+    lines: list[str] = sources + ["",
+        f"loadAmberParams {lig_old_frcmod.resolve()}",
+        _tleap_load(old_resname, lig_old_struct),
+        "",
+        f"loadAmberParams {lig_new_frcmod.resolve()}",
+        _tleap_load(new_resname, lig_new_struct),
+        "",
+    ]
+
+    if leg == "bound" and "protein" in cfg:
+        pdb = Path(cfg["protein"]["pdb"]).resolve()
+        lines += [
+            f"protein = loadPdb {pdb}",
+            f"solute  = combine {{protein {old_resname} {new_resname}}}",
+        ]
+    else:
+        lines += [f"solute = combine {{{old_resname} {new_resname}}}"]
+
+    lines += [
+        "",
+        f"solvatebox solute {box} {padding}",
+        "addions solute Na+ 0",
+        "addions solute Cl- 0",
+    ]
+    if n_Na:
+        lines.append(f"addionsrand solute Na+ {n_Na}")
+    if n_Cl:
+        lines.append(f"addionsrand solute Cl- {n_Cl}")
+
+    out_parm = work_dir / "ti.parm7"
+    out_rst  = work_dir / "ti.rst7"
+    lines += [
+        "",
+        f"saveAmberParm solute {out_parm.resolve()} {out_rst.resolve()}",
+        "quit",
+    ]
+
+    tleap_in = work_dir / "tleap.in"
+    tleap_in.write_text("\n".join(lines) + "\n")
+
+    stdout = _run(["tleap", "-f", str(tleap_in.resolve())],
+                  cwd=work_dir, desc=f"tleap ({leg})")
+    (work_dir / "tleap.out").write_text(stdout)
+
+    for f in (out_parm, out_rst):
+        if not f.exists():
+            sys.exit(
+                f"tleap did not produce {f}.\n"
+                f"Check {work_dir / 'tleap.out'} for details."
+            )
+
+    return out_parm, out_rst
+
+
+# =============================================================================
+# Mask derivation
+# =============================================================================
+
+def derive_masks(
+    parm7: Path,
+    old_resname: str, new_resname: str,
+    unique_old_names: list[str], unique_new_names: list[str],
+) -> tuple[str, str, str, str]:
+    """
+    Derive AMBER TI mask strings by parsing the parm7 RESIDUE_LABEL section.
+
+    timask selects whole residues (`:N` format).
+    scmask selects soft-core atoms by name within a residue (`:N@n1,n2,...`).
+
+    Returns (timask1, timask2, scmask1, scmask2).
+    """
+    m = re.search(
+        r'%FLAG RESIDUE_LABEL\s+%FORMAT\([^)]+\)\s+(.*?)(?=%FLAG|\Z)',
+        parm7.read_text(), re.DOTALL,
+    )
+    if not m:
+        sys.exit(f"Cannot parse RESIDUE_LABEL section from {parm7}")
+
+    labels = m.group(1).split()
+    old_resnum = new_resnum = None
+    for i, label in enumerate(labels, 1):
+        if label == old_resname and old_resnum is None:
+            old_resnum = i
+        elif label == new_resname and new_resnum is None:
+            new_resnum = i
+
+    if old_resnum is None:
+        sys.exit(
+            f"Residue '{old_resname}' not found in {parm7}.\n"
+            "Check that ligands.old.name matches the residue name in the PDB."
+        )
+    if new_resnum is None:
+        sys.exit(
+            f"Residue '{new_resname}' not found in {parm7}.\n"
+            "Check that ligands.new.name matches the residue name in the PDB."
+        )
+
+    timask1 = f'":{old_resnum}"'
+    timask2 = f'":{new_resnum}"'
+
+    def _scmask(resnum: int, names: list[str]) -> str:
+        if not names:
+            return '""'      # no soft-core atoms (pure charge/type perturbation)
+        return f'":{resnum}@{",".join(names)}"'
+
+    scmask1 = _scmask(old_resnum, unique_old_names)
+    scmask2 = _scmask(new_resnum, unique_new_names)
+
+    return timask1, timask2, scmask1, scmask2
+
+
+# =============================================================================
+# AMBER input templates
+# =============================================================================
+
+_MIN_TEMPLATE = """\
+minimisation
+ &cntrl
+   imin = 1, ntmin = 2, maxcyc = {maxcyc},
+   ntpr = {ntpr}, ntwe = 20, dx0 = 1.0D-7,
+   ntb = 1, ntxo = 1,
+   icfe = 1, ifsc = 1, clambda = 0.5, scalpha = 0.5, scbeta = 12.0,
+   logdvdl = 0,
+   timask1 = {timask1}, timask2 = {timask2},
+   scmask1 = {scmask1}, scmask2 = {scmask2},
+ /
+"""
+
+_HEATING_TEMPLATE = """\
+NVT heating
+ &cntrl
+   nstlim = {nstlim}, irest = 0, ntx = 1, dt = {dt},
+   nmropt = 1, ntt = 3, tempi = {tempi}, temp0 = {temp0},
+   gamma_ln = 2.0, ig = -1,
+   ntc = 1, ntf = 1, ntb = 1, ntp = 0,
+   ntwe = {ntwx}, ntwx = {ntwx}, ntpr = {ntwx}, ntwr = {ntwx},
+   icfe = 1, ifsc = 1, clambda = 0.5, scalpha = 0.5, scbeta = 12.0,
+   logdvdl = 0,
+   timask1 = {timask1}, timask2 = {timask2},
+   scmask1 = {scmask1}, scmask2 = {scmask2},
+ /
+ &wt type='TEMP0', istep1=0,            istep2={ramp_end},    value1={tempi}, value2={temp0} /
+ &wt type='TEMP0', istep1={ramp_end_p1}, istep2={nstlim},     value1={temp0}, value2={temp0} /
+ &wt type='END' /
+ /
+"""
+
+_EQUIL_TEMPLATE = """\
+TI equilibration
+ &cntrl
+   imin = 0, nstlim = {nstlim}, irest = 0, ntx = 1, dt = {dt},
+   ntt = 3, temp0 = {temp0}, gamma_ln = 2.0, ig = -1,
+   ntc = 1, ntf = 1,
+   ntb = 2, ntp = 1, pres0 = 1.01325, taup = 2.0, barostat = 2,
+   ntwe = {ntwx}, ntwx = {ntwx}, ntpr = {ntwx}, ntwr = {ntwx},
+   icfe = 1, ifsc = 1, clambda = 0.5, scalpha = 0.5, scbeta = 12.0,
+   logdvdl = 0,
+   timask1 = {timask1}, timask2 = {timask2},
+   scmask1 = {scmask1}, scmask2 = {scmask2},
+ /
+"""
+
+_PROD_TEMPLATE = """\
+TI production   lambda = {clambda:.5f}
+ &cntrl
+   imin = 0, nstlim = {nstlim}, irest = 0, ntx = 1, dt = {dt},
+   ntt = 3, temp0 = {temp0}, gamma_ln = 2.0, ig = -1,
+   ntc = 1, ntf = 1,
+   ntb = 2, ntp = 1, pres0 = 1.01325, taup = 2.0, barostat = 2,
+   ntwe = {ntwe}, ntwx = {ntwx}, ntpr = {ntwe}, ntwr = {ntwe},
+   icfe = 1, ifsc = 1, clambda = {clambda:.5f}, scalpha = 0.5, scbeta = 12.0,
+   logdvdl = 0,
+   timask1 = {timask1}, timask2 = {timask2},
+   scmask1 = {scmask1}, scmask2 = {scmask2},{mbar_block}
+ /
+"""
+
+
+# =============================================================================
+# SLURM / local script helpers  (adapted from fep_runner.py)
+# =============================================================================
+
+def _sbatch_header(job_name: str, resources: dict) -> str:
+    lines = [
+        "#!/bin/bash",
+        f"#SBATCH --job-name={job_name}",
+        "#SBATCH --output=mpi_%j.out",
+        "#SBATCH --error=mpi_%j.err",
+        f"#SBATCH --ntasks={resources['ntasks']}",
+    ]
+    for k, v in resources.items():
+        if k != "ntasks":
+            lines.append(f"#SBATCH --{k}={v}")
+    return "\n".join(lines)
+
+
+def _module_block(module: str) -> str:
+    return f"\nmodule purge\nmodule load {module}\n"
+
+
+def _symlink(src: Path, dst: Path) -> None:
+    if dst.is_symlink() or dst.exists():
+        dst.unlink()
+    dst.symlink_to(src)
+
+
+def _write_exe(path: Path, content: str) -> None:
+    path.write_text(content)
+    path.chmod(0o755)
+
+
+def _equil_cpptraj_params(cfg: dict, n_replicas: int) -> tuple[int, int, int]:
+    equil = cfg["simulation"]["equil"]
+    total = equil["nstlim"] // equil["ntwx"]
+    start = total // 2
+    if n_replicas == 1:
+        return total, total, 1
+    step = (total - start) // (n_replicas - 1)
+    return start, total, step
+
+
+def _gen_equilibration_cmd(
+    leg: str, n_replicas: int, mid: int, cfg: dict, mode: str
+) -> str:
+    res   = cfg["slurm"]["gpu"]
+    gpu   = cfg["execution_command"]["gpu"]
+    start, end, step = _equil_cpptraj_params(cfg, n_replicas)
+
+    lines = [
+        _sbatch_header(f"equil-{leg}", res),
+        _module_block(cfg["amber"]["cuda_module"]),
+        "# ---- Minimisation",
+        f"{gpu} -i min.in -c ti.rst7 -p ti.parm7 -O \\",
+        "    -o min.out -inf min.info -e min.en -r min.rst7 -l min.log",
+        "",
+        "# ---- NVT heating",
+        f"{gpu} -i heating.in -c min.rst7 -p ti.parm7 -O \\",
+        "    -o heating.out -inf heating.info -e heating.en -r heating.rst7 -x heating.nc -l heating.log",
+        "",
+        "# ---- Equilibration",
+        f"{gpu} -i equil.in -c heating.rst7 -p ti.parm7 -O \\",
+        "    -o equil.out -inf equil.info -e equil.en -r equil.rst7 -x equil.nc -l equil.log",
+        "",
+        f"# Extract {n_replicas} restart(s) from the second half of equilibration",
+    ]
+    for r in range(1, n_replicas + 1):
+        frame = start + (r - 1) * step if n_replicas > 1 else end
+        lines += [
+            "cpptraj <<_EOF",
+            "parm ti.parm7",
+            f"trajin equil.nc {frame} {frame} 1",
+            f"trajout equil.rst7.{r} restart",
+            "_EOF", "",
+        ]
+
+    top = "top=$(pwd)"
+    if mode == "parallel":
+        lines += [
+            top,
+            f"for r in $(seq 1 {n_replicas}); do",
+            f'    (cd "$top/replica_${{r}}/{mid}" && sbatch FEP_PROD_{mid}.cmd)',
+            "done", "",
+        ]
+    else:
+        lines += [top, f"cd $top/replica_1/{mid}", f"sbatch FEP_PROD_{mid}.cmd", ""]
+
+    return "\n".join(lines)
+
+
+def _prod_submissions(window: int, replica: int,
+                      n_windows: int, n_replicas: int,
+                      mode: str) -> list[tuple[str, str]]:
+    mid = _middle(n_windows)
+    if mode == "parallel":
+        if window == mid:
+            return [(f"../{mid-1}", f"FEP_PROD_{mid-1}.cmd"),
+                    (f"../{mid+1}", f"FEP_PROD_{mid+1}.cmd")]
+        if 1 < window < mid:
+            return [(f"../{window-1}", f"FEP_PROD_{window-1}.cmd")]
+        if mid < window < n_windows:
+            return [(f"../{window+1}", f"FEP_PROD_{window+1}.cmd")]
+        return []
+    # serial
+    if window == mid:
+        return [(f"../{mid-1}", f"FEP_PROD_{mid-1}.cmd")]
+    if 1 < window < mid:
+        return [(f"../{window-1}", f"FEP_PROD_{window-1}.cmd")]
+    if window == 1:
+        return [(f"../{mid+1}", f"FEP_PROD_{mid+1}.cmd")]
+    if mid < window < n_windows:
+        return [(f"../{window+1}", f"FEP_PROD_{window+1}.cmd")]
+    if replica < n_replicas:
+        return [(f"../../replica_{replica+1}/{mid}", f"FEP_PROD_{mid}.cmd")]
+    return []
+
+
+def _gen_prod_cmd(
+    window: int, replica: int, n_windows: int, n_replicas: int,
+    leg: str, cfg: dict, mode: str
+) -> str:
+    mid   = _middle(n_windows)
+    res   = cfg["slurm"]["gpu"]
+    gpu   = cfg["execution_command"]["gpu"]
+
+    coords = (
+        f"../../equil.rst7.{replica}" if window == mid
+        else f"../{window+1}/ti{replica}_{window+1}.rst7" if window < mid
+        else f"../{window-1}/ti{replica}_{window-1}.rst7"
+    )
+
+    subs  = _prod_submissions(window, replica, n_windows, n_replicas, mode)
+    lines = [
+        _sbatch_header(f"R{replica}.{window}-{leg}", res),
+        _module_block(cfg["amber"]["cuda_module"]),
+        f"{gpu} -i ti_{window}.in -c {coords} -p ti.parm7 -O \\",
+        f"    -o ti{replica}_{window}.out -inf ti{replica}_{window}.info "
+        f"-e ti{replica}_{window}.en \\",
+        f"    -r ti{replica}_{window}.rst7 -x ti{replica}_{window}.nc "
+        f"-l ti{replica}_{window}.log",
+        "",
+    ]
+    if len(subs) > 1:
+        for d, c in subs:
+            lines.append(f"(cd {d} && sbatch {c})")
+        lines.append("")
+    elif subs:
+        d, c = subs[0]
+        lines += [f"cd {d}", f"sbatch {c}", ""]
+
+    return "\n".join(lines)
+
+
+# =============================================================================
+# Simulation input generation
+# =============================================================================
+
+def generate_leg_inputs(
+    leg: str,
+    prep_parm7: Path, prep_rst7: Path,
+    timask1: str, timask2: str, scmask1: str, scmask2: str,
+    lambdas: np.ndarray, weights: np.ndarray,
+    cfg: dict, mode: str,
+) -> None:
+    """
+    Write all AMBER input files and job scripts for one leg (unbound / bound).
+
+    Directory layout mirrors fep_runner.py so the same analyse command works.
+    """
+    mutation_dir = Path(
+        f"{cfg['ligands']['old']['name']}_to_{cfg['ligands']['new']['name']}"
+    )
+    leg_dir = mutation_dir / leg
+    leg_dir.mkdir(parents=True, exist_ok=True)
+
+    sim   = cfg["simulation"]
+    temp  = float(cfg["temperature"])
+    n_lam = len(lambdas)
+    n_rep = cfg["replicates"]
+    mid   = _middle(n_lam)
+    mbar  = bool(cfg.get("mbar", True))
+
+    mbar_blk  = _format_mbar_block(lambdas) if mbar else ""
+    mask_kw   = dict(timask1=timask1, timask2=timask2,
+                     scmask1=scmask1, scmask2=scmask2)
+
+    # Symlinks to topology and coordinates at the leg level
+    _symlink(prep_parm7.resolve(), leg_dir / "ti.parm7")
+    _symlink(prep_rst7.resolve(),  leg_dir / "ti.rst7")
+
+    # Shared stage inputs -------------------------------------------------------
+    (leg_dir / "min.in").write_text(
+        _MIN_TEMPLATE.format(
+            maxcyc=sim["min"]["maxcyc"], ntpr=sim["min"]["ntpr"], **mask_kw)
+    )
+    _heat = sim["heating"]
+    ramp  = int(0.8 * _heat["nstlim"])
+    (leg_dir / "heating.in").write_text(
+        _HEATING_TEMPLATE.format(
+            nstlim=_heat["nstlim"], dt=_heat["dt"], ntwx=_heat["ntwx"],
+            tempi=_heat["tempi"], temp0=temp,
+            ramp_end=ramp, ramp_end_p1=ramp + 1, **mask_kw)
+    )
+    (leg_dir / "equil.in").write_text(
+        _EQUIL_TEMPLATE.format(
+            nstlim=sim["equil"]["nstlim"], dt=sim["equil"]["dt"],
+            ntwx=sim["equil"]["ntwx"], temp0=temp, **mask_kw)
+    )
+
+    # Mode-specific job scripts -------------------------------------------------
+    if mode == "local":
+        _write_exe(leg_dir / "run_local.sh",
+                   _gen_local_script(leg, n_lam, n_rep, lambdas, cfg,
+                                     timask1, timask2, scmask1, scmask2))
+    else:
+        _write_exe(leg_dir / "EQUILIBRATION.cmd",
+                   _gen_equilibration_cmd(leg, n_rep, mid, cfg, mode))
+
+    # Per-replica / per-window --------------------------------------------------
+    for replica in range(1, n_rep + 1):
+        for w_idx, clambda in enumerate(lambdas, 1):
+            win_dir = leg_dir / f"replica_{replica}" / str(w_idx)
+            win_dir.mkdir(parents=True, exist_ok=True)
+            _symlink(prep_parm7.resolve(), win_dir / "ti.parm7")
+
+            (win_dir / f"ti_{w_idx}.in").write_text(
+                _PROD_TEMPLATE.format(
+                    nstlim=sim["prod"]["nstlim"], dt=sim["prod"]["dt"],
+                    ntwe=sim["prod"]["ntwe"], ntwx=sim["prod"]["ntwx"],
+                    clambda=clambda, temp0=temp,
+                    mbar_block=mbar_blk, **mask_kw)
+            )
+
+            if mode != "local":
+                _write_exe(
+                    win_dir / f"FEP_PROD_{w_idx}.cmd",
+                    _gen_prod_cmd(w_idx, replica, n_lam, n_rep,
+                                  leg, cfg, mode),
+                )
+
+
+def _gen_local_script(
+    leg: str, n_windows: int, n_replicas: int,
+    lambdas: np.ndarray, cfg: dict,
+    timask1: str, timask2: str, scmask1: str, scmask2: str,
+) -> str:
+    mid  = _middle(n_windows)
+    sim  = cfg["simulation"]
+    temp = cfg["temperature"]
+    start, end, step = _equil_cpptraj_params(cfg, n_replicas)
+    order = list(range(mid, 0, -1)) + list(range(mid + 1, n_windows + 1))
+
+    cuda_lib = cfg.get("amber", {}).get("cuda_lib_path", "").strip()
+
+    L = [
+        "#!/bin/bash",
+        f"# Sequential TI run for {leg} — no SLURM required.",
+        "set -euo pipefail",
+        'SYSDIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"',
+        'cd "$SYSDIR"',
+        ': "${AMBERHOME:?Set AMBERHOME before running}"',
+        'AMBER="$AMBERHOME/bin/pmemd.cuda"',
+        'CPPTRAJ="$AMBERHOME/bin/cpptraj"',
+        "",
+    ]
+    if cuda_lib:
+        L.append(f'export LD_LIBRARY_PATH="{cuda_lib}:${{LD_LIBRARY_PATH:-}}"')
+
+    L += [
+        'log() { echo "[$(date "+%Y-%m-%d %H:%M:%S")] $*"; }',
+        "",
+        'log "Minimisation"',
+        '$AMBER -i min.in -c ti.rst7 -p ti.parm7 -O \\',
+        '    -o min.out -inf min.info -e min.en -r min.rst7 -l min.log',
+        "",
+        'log "Heating"',
+        '$AMBER -i heating.in -c min.rst7 -p ti.parm7 -O \\',
+        '    -o heating.out -inf heating.info -e heating.en -r heating.rst7 -x heating.nc -l heating.log',
+        "",
+        'log "Equilibration"',
+        '$AMBER -i equil.in -c heating.rst7 -p ti.parm7 -O \\',
+        '    -o equil.out -inf equil.info -e equil.en -r equil.rst7 -x equil.nc -l equil.log',
+        "",
+    ]
+    for r in range(1, n_replicas + 1):
+        frame = start + (r - 1) * step if n_replicas > 1 else end
+        L += [
+            '$CPPTRAJ <<_EOF',
+            "parm ti.parm7",
+            f"trajin equil.nc {frame} {frame} 1",
+            f"trajout equil.rst7.{r} restart",
+            "_EOF", "",
+        ]
+    for replica in range(1, n_replicas + 1):
+        L.append(f'log "Replica {replica}/{n_replicas}"')
+        for window in order:
+            clambda = lambdas[window - 1]
+            coords = (
+                f"../../equil.rst7.{replica}" if window == mid
+                else f"../{window+1}/ti{replica}_{window+1}.rst7" if window < mid
+                else f"../{window-1}/ti{replica}_{window-1}.rst7"
+            )
+            L += [
+                f'log "  window {window}/{n_windows}  lambda={clambda:.5f}"',
+                f'cd "$SYSDIR/replica_{replica}/{window}"',
+                f'$AMBER -i ti_{window}.in -c {coords} -p ti.parm7 -O \\',
+                f'    -o ti{replica}_{window}.out -inf ti{replica}_{window}.info \\',
+                f'    -e ti{replica}_{window}.en   -r ti{replica}_{window}.rst7 \\',
+                f'    -x ti{replica}_{window}.nc   -l ti{replica}_{window}.log',
+                "",
+            ]
+    L.append('log "All done."')
+    return "\n".join(L)
+
+
+# =============================================================================
+# Analysis  (TI + MBAR — same logic as fep_runner.py)
+# =============================================================================
+
+def _extract_dvdl(en_file: Path, tail: int) -> np.ndarray:
+    values: list[float] = []
+    with open(en_file) as fh:
+        for line in fh:
+            if line.startswith(" L9") or line.startswith("L9"):
+                parts = line.split()
+                if len(parts) >= 6:
+                    try:
+                        values.append(float(parts[5]))
+                    except ValueError:
+                        pass
+    if not values:
+        raise RuntimeError(f"No L9 records in {en_file}")
+    return np.array(values[-tail:])
+
+
+def _extract_mbar_energies(en_file: Path, n_states: int) -> np.ndarray:
+    frames: list[list[float]] = []
+    with open(en_file) as fh:
+        for line in fh:
+            s = line.strip()
+            if s.startswith("MBAR") and len(s) > 4:
+                parts = s.split()
+                try:
+                    vals = [float(x) for x in parts[1:]]
+                except ValueError:
+                    continue
+                if len(vals) == n_states:
+                    frames.append(vals)
+    if not frames:
+        raise RuntimeError(
+            f"No MBAR records in {en_file}.\n"
+            "  Ensure the simulation was run with mbar: true in the config."
+        )
+    return np.array(frames)
+
+
+def _ti_system_dg(
+    leg: str, base: Path, n_replicas: int, n_lambdas: int,
+    weights: np.ndarray, tail: int,
+) -> tuple[float, float]:
+    replica_dg: list[float] = []
+    for replica in range(1, n_replicas + 1):
+        means = [
+            _extract_dvdl(
+                base / leg / f"replica_{replica}" / str(w) /
+                f"ti{replica}_{w}.en", tail
+            ).mean()
+            for w in range(1, n_lambdas + 1)
+        ]
+        dg = float(np.dot(means, weights))
+        print(f"    replica {replica}: ΔG(TI) = {dg:9.3f} kcal/mol")
+        replica_dg.append(dg)
+    mean = float(np.mean(replica_dg))
+    std  = float(np.std(replica_dg))
+    print(f"    mean          : ΔG(TI) = {mean:9.3f} ± {std:.3f} kcal/mol")
+    return mean, std
+
+
+def _mbar_system_dg(
+    leg: str, base: Path, n_replicas: int, n_lambdas: int,
+    tail: int, temp: float,
+) -> tuple[float, float]:
+    try:
+        from pymbar import MBAR
+    except ImportError:
+        raise ImportError("pymbar >= 4 required:  conda install -c conda-forge pymbar")
+
+    beta     = _mbar_beta(temp)
+    n_states = n_lambdas + 2   # GL nodes + λ=0 + λ=1 endpoints
+
+    replica_dg: list[float] = []
+    for replica in range(1, n_replicas + 1):
+        window_E: list[np.ndarray] = []
+        for w in range(1, n_lambdas + 1):
+            en = (base / leg / f"replica_{replica}" / str(w) /
+                  f"ti{replica}_{w}.en")
+            window_E.append(_extract_mbar_energies(en, n_states))
+
+        n_frames = min(min(E.shape[0], tail) for E in window_E)
+        window_E = [E[-n_frames:] for E in window_E]
+
+        N_k = np.zeros(n_states, dtype=int)
+        N_k[1:n_lambdas + 1] = n_frames
+
+        u_kn = np.empty((n_states, n_lambdas * n_frames))
+        for wi, E_w in enumerate(window_E):
+            c = wi * n_frames
+            u_kn[:, c:c + n_frames] = beta * E_w.T
+
+        result = MBAR(u_kn, N_k).compute_free_energy_differences()
+        dg  = float(result["Delta_f"][0, -1])  / beta
+        ddg = float(result["dDelta_f"][0, -1]) / beta
+        print(f"    replica {replica}: ΔG(MBAR) = {dg:9.3f} ± {ddg:.3f} kcal/mol")
+        replica_dg.append(dg)
+
+    mean = float(np.mean(replica_dg))
+    std  = float(np.std(replica_dg))
+    print(f"    mean          : ΔG(MBAR) = {mean:9.3f} ± {std:.3f} kcal/mol")
+    return mean, std
+
+
+# =============================================================================
+# Top-level commands
+# =============================================================================
+
+def prepare(cfg: dict, mode: str = "serial", dry_run: bool = False,
+            skip_param: bool = False) -> None:
+    """
+    Full preparation pipeline:
+      1. Parameterise both ligands.
+      2. Compute FE-aware atom mapping; write mapping.json.
+      3. Detect net charge change; warn if ΔQ ≠ 0.
+      4. Build solvated systems with tleap (unbound + bound legs).
+      5. Derive TI masks from the parm7 RESIDUE_LABEL section.
+      6. Write AMBER input files and job scripts for all λ windows.
+    """
+    check_environment()
+    validate_config(cfg)
+
+    old_cfg  = cfg["ligands"]["old"]
+    new_cfg  = cfg["ligands"]["new"]
+    old_name = old_cfg["name"]
+    new_name = new_cfg["name"]
+    pdb_old = Path(old_cfg["pdb"])
+    pdb_new = Path(new_cfg["pdb"])
+
+    mutation = f"{old_name}_to_{new_name}"
+    prep_dir = Path(mutation) / "prep"
+
+    lambdas, weights = compute_gl_quadrature(cfg["n_lambdas"])
+    mid  = _middle(cfg["n_lambdas"])
+    mbar = bool(cfg.get("mbar", True))
+
+    print(f"\n{'═' * 62}")
+    print(f"  Mutation : {mutation}")
+    print(f"  Mode     : {mode}   Windows : {cfg['n_lambdas']}   "
+          f"Replicas : {cfg['replicates']}")
+    print(f"  Temp     : {cfg['temperature']} K")
+    print(f"  MBAR     : {'enabled' if mbar else 'disabled'}")
+    if dry_run:
+        print("  DRY RUN — no files will be written.")
+    print(f"{'═' * 62}\n")
+
+    # ── Step 1: parameterise ligands ─────────────────────────────────────
+    print("[1/6] Parameterising ligands...")
+
+    def _param_dir(name: str) -> Path:
+        return Path("parameters") / name
+
+    if skip_param:
+        old_struct = Path(old_cfg["lib"])    if "lib"    in old_cfg else _param_dir(old_name) / f"{old_name}.lib"
+        old_frcmod = Path(old_cfg["frcmod"]) if "frcmod" in old_cfg else _param_dir(old_name) / f"{old_name}.frcmod"
+        new_struct = Path(new_cfg["lib"])    if "lib"    in new_cfg else _param_dir(new_name) / f"{new_name}.lib"
+        new_frcmod = Path(new_cfg["frcmod"]) if "frcmod" in new_cfg else _param_dir(new_name) / f"{new_name}.frcmod"
+        for f in (old_struct, old_frcmod, new_struct, new_frcmod):
+            if not f.exists():
+                sys.exit(f"  --skip-param requested but file not found: {f}")
+        print("  Skipping — using existing parameter files.")
+    elif not dry_run:
+        old_struct, old_frcmod = parameterize_ligand(pdb_old, old_name, cfg)
+        new_struct, new_frcmod = parameterize_ligand(pdb_new, new_name, cfg)
+    else:
+        old_struct = _param_dir(old_name) / f"{old_name}.lib"
+        old_frcmod = _param_dir(old_name) / f"{old_name}.frcmod"
+        new_struct = _param_dir(new_name) / f"{new_name}.lib"
+        new_frcmod = _param_dir(new_name) / f"{new_name}.frcmod"
+
+    # ── Step 2: atom mapping ─────────────────────────────────────────────
+    override_mapping = cfg.pop("_override_mapping", None)
+    if override_mapping is not None:
+        mapping = override_mapping
+        print("\n[2/6] Using manually supplied atom mapping (--override-mapping).")
+    else:
+        print("\n[2/6] Computing FE-aware atom mapping...")
+        mapping = compute_fe_mapping(pdb_old, pdb_new)
+
+    print(f"  Common heavy atoms : {mapping['n_common_heavy']}")
+    print(f"  Soft-core (old)    : {len(mapping['unique_old'])} atoms  "
+          f"→ {mapping['unique_old']}")
+    print(f"  Soft-core (new)    : {len(mapping['unique_new'])} atoms  "
+          f"→ {mapping['unique_new']}")
+    print(f"  Mapping FE score   : {mapping['score']:.1f}  (lower is better)")
+
+    if not dry_run:
+        map_path = prep_dir / "mapping.json"
+        map_path.parent.mkdir(parents=True, exist_ok=True)
+        map_path.write_text(json.dumps(mapping, indent=2))
+        print(f"\n  Mapping written to {map_path}")
+        if override_mapping is None:
+            print("  Review it and re-run with --override-mapping if needed.")
+
+    # ── Step 3: charge check ─────────────────────────────────────────────
+    print("\n[3/6] Checking formal charges...")
+    q_old, q_new = detect_formal_charges(pdb_old, pdb_new)
+    delta_q = q_new - q_old
+    print(f"  Q(old) = {q_old:+d}    Q(new) = {q_new:+d}    ΔQ = {delta_q:+d}")
+    if delta_q != 0:
+        print(
+            f"\n  WARNING: ΔQ = {delta_q:+d} — the net charge changes between end states.\n"
+            "  The ion count in the topology neutralises the combined (old + new)\n"
+            "  ligand charge. This is a pragmatic approximation; for rigorous\n"
+            "  ΔQ ≠ 0 handling build separate topologies per endpoint (see\n"
+            "  AMBER TI tutorial 3 / Rocklin et al. JCTC 2013)."
+        )
+
+    # ── Step 4: build systems ────────────────────────────────────────────
+    print("\n[4/6] Building solvated systems with tleap...")
+    has_protein = "protein" in cfg
+
+    if has_protein:
+        print(f"  Checking protein PDB: {cfg['protein']['pdb']}")
+        if not dry_run:
+            check_pdb(Path(cfg["protein"]["pdb"]))
+
+    legs = (["unbound", "bound"] if has_protein else ["unbound"])
+    parm7: dict[str, Path] = {}
+    rst7:  dict[str, Path] = {}
+
+    for leg in legs:
+        print(f"\n  Building {leg} system...")
+        if not dry_run:
+            p7, r7 = build_system(
+                leg, old_struct, old_frcmod, new_struct, new_frcmod,
+                old_name, new_name, q_old, q_new, cfg,
+                prep_dir / leg,
+            )
+            parm7[leg] = p7
+            rst7[leg]  = r7
+        else:
+            parm7[leg] = prep_dir / leg / "ti.parm7"
+            rst7[leg]  = prep_dir / leg / "ti.rst7"
+
+    # ── Step 5: derive masks ─────────────────────────────────────────────
+    print("\n[5/6] Deriving AMBER TI masks...")
+    masks: dict[str, tuple] = {}
+
+    for leg in legs:
+        if dry_run:
+            masks[leg] = (f'":{old_name}"', f'":{new_name}"',
+                          f'"soft-core-old"', f'"soft-core-new"')
+            print(f"  [{leg}] (dry run — masks not derived)")
+            continue
+
+        tm1, tm2, sm1, sm2 = derive_masks(
+            parm7[leg], old_name, new_name,
+            mapping["unique_old"], mapping["unique_new"],
+        )
+        masks[leg] = (tm1, tm2, sm1, sm2)
+        print(f"  [{leg}]")
+        print(f"    timask1 = {tm1}")
+        print(f"    timask2 = {tm2}")
+        print(f"    scmask1 = {sm1}")
+        print(f"    scmask2 = {sm2}")
+
+    # ── Step 6: write simulation inputs ──────────────────────────────────
+    print(f"\n[6/6] Writing simulation inputs ({mode} mode)...")
+    if not dry_run:
+        for leg in legs:
+            tm1, tm2, sm1, sm2 = masks[leg]
+            generate_leg_inputs(
+                leg, parm7[leg], rst7[leg],
+                tm1, tm2, sm1, sm2,
+                lambdas, weights, cfg, mode,
+            )
+            print(f"  [{leg}] → {Path(mutation) / leg}/")
+
+    print(f"\n{'═' * 62}")
+    if dry_run:
+        print("  Dry run complete — no files were written.")
+    else:
+        print("  Preparation complete.")
+        print(f"  Submit with:  python rbfe_runner.py submit --mode {mode}")
+    print(f"{'═' * 62}\n")
+
+
+def submit(cfg: dict, mode: str = "serial") -> None:
+    """Submit the equilibration job for each leg."""
+    mutation = f"{cfg['ligands']['old']['name']}_to_{cfg['ligands']['new']['name']}"
+    legs = (["unbound", "bound"] if "protein" in cfg else ["unbound"])
+
+    if mode == "local":
+        for leg in legs:
+            script = Path(mutation) / leg / "run_local.sh"
+            if not script.exists():
+                sys.exit(f"Script not found: {script}\nRun 'prepare --mode local' first.")
+            log = Path(mutation) / leg / "run.log"
+            import subprocess as _sp
+            proc = _sp.Popen(
+                f"bash {script.resolve()} > {log.resolve()} 2>&1",
+                shell=True, start_new_session=True,
+            )
+            print(f"  [{leg}] launched in background (PID {proc.pid}) → {log}")
+        return
+
+    for leg in legs:
+        leg_dir = Path(mutation) / leg
+        cmd_file = leg_dir / "EQUILIBRATION.cmd"
+        if not cmd_file.exists():
+            sys.exit(f"Script not found: {cmd_file}\nRun 'prepare' first.")
+        import subprocess as _sp
+        res = _sp.run(
+            ["sbatch", "EQUILIBRATION.cmd"],
+            capture_output=True, text=True, cwd=str(leg_dir),
+        )
+        if res.returncode == 0:
+            print(f"  [{leg}] {res.stdout.strip()}")
+        else:
+            print(f"  [{leg}] sbatch failed: {res.stderr.strip()}", file=sys.stderr)
+
+
+def analyse(cfg: dict, tail: int = 4000) -> None:
+    """Compute ΔΔG = ΔG(bound) − ΔG(unbound) via TI and, if enabled, MBAR."""
+    validate_config(cfg)
+
+    mutation = f"{cfg['ligands']['old']['name']}_to_{cfg['ligands']['new']['name']}"
+    base     = Path(mutation)
+    n_lam    = cfg["n_lambdas"]
+    n_rep    = cfg["replicates"]
+    temp     = float(cfg["temperature"])
+    mbar     = bool(cfg.get("mbar", True))
+    _, weights = compute_gl_quadrature(n_lam)
+    legs     = (["unbound", "bound"] if "protein" in cfg else ["unbound"])
+
+    print(f"\n{'═' * 62}")
+    print(f"  Mutation : {mutation}")
+    print(f"  Windows  : {n_lam}    Replicas : {n_rep}")
+    print(f"  Temp     : {temp} K    β = {_mbar_beta(temp):.4f} mol/kcal")
+    print(f"  Records  : last {tail} dV/dλ frames per window")
+    if mbar:
+        print("  MBAR     : enabled")
+    print(f"{'═' * 62}")
+
+    ti_results:   dict[str, tuple[float, float]] = {}
+    mbar_results: dict[str, tuple[float, float]] = {}
+
+    for leg in legs:
+        print(f"\n  [{leg}]  TI (Gauss-Legendre)")
+        try:
+            ti_results[leg] = _ti_system_dg(
+                leg, base, n_rep, n_lam, weights, tail)
+        except (FileNotFoundError, RuntimeError) as exc:
+            sys.exit(f"  ERROR: {exc}")
+
+        if mbar:
+            print(f"\n  [{leg}]  MBAR")
+            try:
+                mbar_results[leg] = _mbar_system_dg(
+                    leg, base, n_rep, n_lam, tail, temp)
+            except (FileNotFoundError, RuntimeError, ImportError) as exc:
+                print(f"  WARNING: MBAR failed — {exc}")
+
+    print(f"\n{'═' * 62}")
+    if "bound" in ti_results and "unbound" in ti_results:
+        print("  ΔΔG = ΔG(bound) − ΔG(unbound)")
+        ub_ti, b_ti = ti_results["unbound"], ti_results["bound"]
+        ddG_ti = b_ti[0] - ub_ti[0]
+        err_ti = (b_ti[1] ** 2 + ub_ti[1] ** 2) ** 0.5
+        print(f"\n  TI / Gauss-Legendre:")
+        print(f"    ΔΔG = {ddG_ti:+.3f} ± {err_ti:.3f} kcal/mol")
+
+        if "bound" in mbar_results and "unbound" in mbar_results:
+            ub_mb, b_mb = mbar_results["unbound"], mbar_results["bound"]
+            ddG_mb = b_mb[0] - ub_mb[0]
+            err_mb = (b_mb[1] ** 2 + ub_mb[1] ** 2) ** 0.5
+            print(f"\n  MBAR (pymbar):")
+            print(f"    ΔΔG = {ddG_mb:+.3f} ± {err_mb:.3f} kcal/mol")
+    else:
+        # Single-leg run (ligand hydration FEP)
+        for leg, (dg, std) in ti_results.items():
+            print(f"  [{leg}]  ΔG(TI) = {dg:+.3f} ± {std:.3f} kcal/mol")
+
+    print(f"{'═' * 62}\n")
+
+
+# =============================================================================
+# Entry point
+# =============================================================================
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="AmberTools-native RBFE workflow — automated atom mapping.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=__doc__,
+    )
+    parser.add_argument("--config", default="config.yaml",
+                        help="Config file (default: config.yaml)")
+
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    p_prep = sub.add_parser("prepare", help="Parameterise, map, build, write inputs")
+    p_prep.add_argument("--mode", default="serial",
+                        choices=["serial", "parallel", "local"])
+    p_prep.add_argument("--dry-run", action="store_true",
+                        help="Validate config and show what would be done; "
+                             "do not run any external tools or write files.")
+    p_prep.add_argument("--skip-param", action="store_true",
+                        help="Skip antechamber/parmchk2/tleap and use existing "
+                             "lib and frcmod files. Paths are read from the "
+                             "ligands.{old,new}.lib/frcmod config keys, falling "
+                             "back to parameters/{name}/{name}.lib/.frcmod.")
+    p_prep.add_argument("--override-mapping",
+                        help="Path to a manually edited mapping.json to use "
+                             "instead of running MCS (skip steps 1-2).")
+
+    p_sub = sub.add_parser("submit", help="Submit SLURM / local jobs")
+    p_sub.add_argument("--mode", default="serial",
+                       choices=["serial", "parallel", "local"])
+
+    p_ana = sub.add_parser("analyse", help="TI + MBAR ΔΔG analysis")
+    p_ana.add_argument("--tail", type=int, default=4000, metavar="N",
+                       help="Last N dV/dλ records per window (default: 4000)")
+
+    args = parser.parse_args()
+
+    config_path = Path(args.config)
+    if not config_path.exists():
+        sys.exit(f"Config file not found: {config_path}")
+    with open(config_path) as fh:
+        cfg = yaml.safe_load(fh)
+
+    if args.command == "prepare":
+        if getattr(args, "override_mapping", None):
+            with open(args.override_mapping) as fh:
+                cfg["_override_mapping"] = json.load(fh)
+        prepare(cfg, mode=args.mode, dry_run=args.dry_run,
+                skip_param=args.skip_param)
+    elif args.command == "submit":
+        submit(cfg, mode=args.mode)
+    elif args.command == "analyse":
+        analyse(cfg, tail=args.tail)
+
+
+if __name__ == "__main__":
+    main()
