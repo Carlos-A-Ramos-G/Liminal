@@ -356,6 +356,17 @@ def _resolve_charge(pdb_path: Path, cfg: dict) -> int:
     return int(raw)
 
 
+def _write_renamed_pdb(src: Path, dst: Path, new_resname: str) -> None:
+    """Copy src PDB to dst with the residue-name field (cols 18-21) set to new_resname."""
+    new_rn = f"{new_resname:<4s}"
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    with open(src) as fin, open(dst, "w") as fout:
+        for line in fin:
+            if line[:6] in ("ATOM  ", "HETATM"):
+                line = line[:17] + new_rn + line[21:]
+            fout.write(line)
+
+
 def parameterize_ligand(
     pdb: Path, resname: str, cfg: dict,
 ) -> tuple[Path, Path]:
@@ -370,6 +381,15 @@ def parameterize_ligand(
     Returns (lib, frcmod).  Aborts on any parmchk2 ATTN warning.
     """
     work_dir = Path("parameters") / resname
+    lib_out  = work_dir / f"{resname}.lib"
+    frc_out  = work_dir / f"{resname}.frcmod"
+    if lib_out.exists() and frc_out.exists():
+        print(f"    {resname}: parameters already exist — skipping antechamber")
+        renamed_pdb = work_dir / f"{resname}.pdb"
+        if not renamed_pdb.exists():
+            _write_renamed_pdb(pdb.resolve(), renamed_pdb.resolve(), resname)
+        return lib_out.resolve(), frc_out.resolve()
+
     work_dir.mkdir(parents=True, exist_ok=True)
     gaff   = cfg["forcefield"]["ligand"]        # gaff | gaff2
     method = cfg["system"]["charge_method"]     # bcc  | mul
@@ -414,6 +434,9 @@ def parameterize_ligand(
 
     if not lib.exists():
         sys.exit(f"tleap did not produce {lib} — check {work_dir}/leap.log")
+
+    renamed_pdb = work_dir / f"{resname}.pdb"
+    _write_renamed_pdb(pdb.resolve(), renamed_pdb.resolve(), resname)
 
     return lib, frcmod
 
@@ -671,30 +694,16 @@ _BOX_NAME: dict[str, str] = {
 }
 
 
-def _estimate_ion_counts(total_solute_charge: int,
-                         conc_M: float,
-                         padding: float) -> tuple[int, int]:
+def _estimate_salt_pairs(conc_M: float, padding: float) -> int:
     """
-    Return (n_Na, n_Cl) for charge neutralisation + physiological NaCl.
+    Return the number of NaCl pairs to add for the target ionic strength.
 
-    Water count is estimated from box volume assuming ~30 Å³/water and a
-    cubic box with edge ≈ 2 * padding + 50 Å (generous for most complexes).
-    The salt count is rounded to the nearest integer.
+    Neutralisation is handled separately by tleap's addIons command.
+    Box volume is estimated assuming edge ≈ 2*padding + 50 Å.
     """
-    edge_A   = 2 * padding + 50.0
-    vol_L    = (edge_A * 1e-10) ** 3 * 1e3          # m³ → L
-    n_salt   = max(0, round(conc_M * 6.022e23 * vol_L))
-
-    if total_solute_charge < 0:
-        n_Na = -total_solute_charge + n_salt
-        n_Cl = n_salt
-    elif total_solute_charge > 0:
-        n_Na = n_salt
-        n_Cl = total_solute_charge + n_salt
-    else:
-        n_Na = n_Cl = n_salt
-
-    return n_Na, n_Cl
+    edge_A = 2 * padding + 50.0
+    vol_L  = (edge_A * 1e-10) ** 3 * 1e3
+    return max(0, round(conc_M * 6.022e23 * vol_L))
 
 
 def _ff_source(key: str, val: str) -> str:
@@ -751,9 +760,11 @@ def build_system(
     water   = ff["water"].lower()
     box     = _BOX_NAME.get(water, "TIP3PBOX")
 
-    # Both ligands are present simultaneously → sum their charges
-    combined_charge = q_old + q_new
-    n_Na, n_Cl = _estimate_ion_counts(combined_charge, conc, padding)
+    n_salt = _estimate_salt_pairs(conc, padding)
+
+    # Renamed PDB files (residue name corrected to match lib)
+    old_coord_pdb = (lig_old_struct.parent / f"{old_resname}.pdb").resolve()
+    new_coord_pdb = (lig_new_struct.parent / f"{new_resname}.pdb").resolve()
 
     sources = [
         f"source {_ff_source(key, val)}"
@@ -764,9 +775,11 @@ def build_system(
     lines: list[str] = sources + ["",
         f"loadAmberParams {lig_old_frcmod.resolve()}",
         _tleap_load(old_resname, lig_old_struct),
+        f"{old_resname} = loadPdb {old_coord_pdb}",
         "",
         f"loadAmberParams {lig_new_frcmod.resolve()}",
         _tleap_load(new_resname, lig_new_struct),
+        f"{new_resname} = loadPdb {new_coord_pdb}",
         "",
     ]
 
@@ -782,13 +795,11 @@ def build_system(
     lines += [
         "",
         f"solvatebox solute {box} {padding}",
-        "addions solute Na+ 0",
-        "addions solute Cl- 0",
+        "addIons solute Na+ 0",
+        "addIons solute Cl- 0",
     ]
-    if n_Na:
-        lines.append(f"addionsrand solute Na+ {n_Na}")
-    if n_Cl:
-        lines.append(f"addionsrand solute Cl- {n_Cl}")
+    if n_salt:
+        lines.append(f"addIonsRand solute Na+ {n_salt} Cl- {n_salt}")
 
     out_parm = work_dir / "ti.parm7"
     out_rst  = work_dir / "ti.rst7"
@@ -1276,21 +1287,53 @@ def _extract_dvdl(en_file: Path, tail: int) -> np.ndarray:
 
 
 def _extract_mbar_energies(en_file: Path, n_states: int) -> np.ndarray:
+    """
+    Parse MBAR cross-energies from the AMBER mdout (.out) file.
+
+    AMBER writes MBAR data to the mdout file, not the .en file, in blocks:
+        MBAR Energy analysis:
+        Energy at {lam} =    {value}
+        ...                              (n_states lines)
+        ---...---
+    """
+    out_file = en_file.with_suffix(".out")
+    if not out_file.exists():
+        raise RuntimeError(
+            f"MBAR output file not found: {out_file}\n"
+            "  AMBER writes MBAR energies to the mdout (.out) file."
+        )
+
     frames: list[list[float]] = []
-    with open(en_file) as fh:
+    block:  list[float]       = []
+    in_block = False
+
+    with open(out_file) as fh:
         for line in fh:
             s = line.strip()
-            if s.startswith("MBAR") and len(s) > 4:
-                parts = s.split()
-                try:
-                    vals = [float(x) for x in parts[1:]]
-                except ValueError:
-                    continue
-                if len(vals) == n_states:
-                    frames.append(vals)
+            if s == "MBAR Energy analysis:":
+                in_block = True
+                block    = []
+            elif in_block:
+                if s.startswith("Energy at"):
+                    # "Energy at 0.0000 =    -24107.31470345"
+                    try:
+                        block.append(float(s.split("=")[-1]))
+                    except ValueError:
+                        in_block = False
+                        block    = []
+                else:
+                    if len(block) == n_states:
+                        frames.append(block)
+                    in_block = False
+                    block    = []
+
+    # Capture a trailing block with no following separator line
+    if in_block and len(block) == n_states:
+        frames.append(block)
+
     if not frames:
         raise RuntimeError(
-            f"No MBAR records in {en_file}.\n"
+            f"No MBAR records in {out_file}.\n"
             "  Ensure the simulation was run with mbar: true in the config."
         )
     return np.array(frames)
@@ -1385,6 +1428,9 @@ def prepare(cfg: dict, mode: str = "serial", dry_run: bool = False,
     pdb_new  = Path(new_cfg["pdb"])
     old_name = old_cfg.get("name") or _stem_to_resname(pdb_old)
     new_name = new_cfg.get("name") or _stem_to_resname(pdb_new)
+    # Write derived names back so downstream functions reading cfg directly work
+    old_cfg["name"] = old_name
+    new_cfg["name"] = new_name
 
     mutation = f"{old_name}_to_{new_name}"
     prep_dir = Path(mutation) / "prep"
@@ -1421,6 +1467,10 @@ def prepare(cfg: dict, mode: str = "serial", dry_run: bool = False,
                     f"  Place GAFF2 parameter files under parameters/{{name}}/ "
                     f"or omit --skip-param to run antechamber."
                 )
+        for name, pdb in ((old_name, pdb_old), (new_name, pdb_new)):
+            renamed = _param_dir(name) / f"{name}.pdb"
+            if not renamed.exists():
+                _write_renamed_pdb(pdb.resolve(), renamed.resolve(), name)
         print("  Skipping — using existing parameter files.")
     elif not dry_run:
         old_struct, old_frcmod = parameterize_ligand(pdb_old, old_name, cfg)
@@ -1541,7 +1591,11 @@ def prepare(cfg: dict, mode: str = "serial", dry_run: bool = False,
 
 def submit(cfg: dict, mode: str = "serial") -> None:
     """Submit the equilibration job for each leg."""
-    mutation = f"{cfg['ligands']['old']['name']}_to_{cfg['ligands']['new']['name']}"
+    ligs = cfg["ligands"]
+    for side in ("old", "new"):
+        if "name" not in ligs[side]:
+            ligs[side]["name"] = _stem_to_resname(Path(ligs[side]["pdb"]))
+    mutation = f"{ligs['old']['name']}_to_{ligs['new']['name']}"
     legs = (["unbound", "bound"] if "protein" in cfg else ["unbound"])
 
     if mode == "local":
@@ -1577,6 +1631,10 @@ def submit(cfg: dict, mode: str = "serial") -> None:
 def analyse(cfg: dict, tail: int = 4000) -> None:
     """Compute ΔΔG = ΔG(bound) − ΔG(unbound) via TI and, if enabled, MBAR."""
     validate_config(cfg)
+    ligs = cfg["ligands"]
+    for side in ("old", "new"):
+        if "name" not in ligs[side]:
+            ligs[side]["name"] = _stem_to_resname(Path(ligs[side]["pdb"]))
 
     mutation = f"{cfg['ligands']['old']['name']}_to_{cfg['ligands']['new']['name']}"
     base     = Path(mutation)

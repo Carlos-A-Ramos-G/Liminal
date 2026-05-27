@@ -12,6 +12,9 @@ sqm.out
 sqm.pdb
 tleap_lib.in
 
+# input pdb files
+structures/*.pdb
+
 # AMBER leap logs
 leap.log
 

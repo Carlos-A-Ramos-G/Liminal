@@ -44,15 +44,15 @@ mbar: true
 # name: residue name used inside AMBER topology (max 4 characters, uppercase recommended)
 ligands:
   old:
-    pdb: structures/ING.pdb    # path relative to this config file
-    name: ING               # ≤ 4 characters
-    lib:    parameters/ING/ING.lib      # optional — used with --skip-param
-    frcmod: parameters/ING/ING.frcmod   # optional — used with --skip-param
+    pdb: structures/4a.pdb    # path relative to this config file
+#    name: 4a               # ≤ 4 characters
+#    lib:    parameters/4a/4a.lib      # optional — used with --skip-param
+#    frcmod: parameters/4a/4a.frcmod   # optional — used with --skip-param
   new:
-    pdb: structures/INI.pdb
-    name: INI
-    lib:    parameters/INI/INI.lib      # optional — used with --skip-param
-    frcmod: parameters/INI/INI.frcmod   # optional — used with --skip-param
+    pdb: structures/4h.pdb
+#    name: 4h
+#    lib:    parameters/4h/4h.lib      # optional — used with --skip-param
+#    frcmod: parameters/4h/4h.frcmod   # optional — used with --skip-param
 
 
 # -----------------------------------------------------------------------------
@@ -120,7 +120,7 @@ slurm:
     ntasks:    1
     gres:      gpu:1
     partition: gpu
-    account: ACCOUNTNAME
+    account: CHEM031804
 
 
 # -----------------------------------------------------------------------------
@@ -152,7 +152,7 @@ simulation:
     ntwx:   100000      # coordinate write frequency (steps)
 
   prod:
-    nstlim: 5000000     # total steps  → 5 ns  at dt = 0.001 ps
+    nstlim: 1000000     # total steps  → 5 ns  at dt = 0.001 ps
     dt:     0.001
     ntwe:   1000        # dV/dλ (and MBAR energies) write frequency (steps)
     ntwx:   10000       # coordinate write frequency (steps)
