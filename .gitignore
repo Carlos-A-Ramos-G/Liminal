@@ -27,3 +27,6 @@ parameters/*/*.mol2
 __pycache__/
 *.pyc
 *.pyo
+
+# Network visualization
+network.html
