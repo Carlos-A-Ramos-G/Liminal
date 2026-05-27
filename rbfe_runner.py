@@ -44,10 +44,12 @@ Usage
 
 import argparse
 import json
+import os
 import re
 import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 import numpy as np
@@ -221,6 +223,100 @@ def _check_frcmod(frcmod: Path) -> None:
 # Ligand parameterisation
 # =============================================================================
 
+def _patch_sqm_out(sqm_out: Path) -> bool:
+    """Reformat sqm.out from new-style header to the format antechamber expects.
+
+    New sqm (AmberTools >= 24) writes:
+        Atom    Element       Mulliken Charge
+        ...
+    Old antechamber parser expects:
+        Mulliken charges:
+        ...
+
+    Returns True if the file was patched, False if already in expected format.
+    """
+    text = sqm_out.read_text()
+    if "Mulliken charges:" in text:
+        return False
+    # Match the new-style table header and convert
+    patched = re.sub(
+        r"Atom\s+Element\s+Mulliken Charge\s*\n",
+        "Mulliken charges:\n          1\n",
+        text,
+    )
+    # Reformat data rows:  "   1  C     -0.123456" → "   1  C    -0.123456"
+    # (antechamber expects the charge in column 3, which already matches — no
+    #  column shift needed, just the header swap above is sufficient)
+    if patched == text:
+        return False
+    sqm_out.write_text(patched)
+    return True
+
+
+def _run_antechamber(cmd: list, cwd: Path, desc: str) -> str:
+    """Run antechamber, retrying once after patching sqm.out if charge parsing fails.
+
+    Some AmberTools builds ship a sqm that writes a different Mulliken charge
+    header than the antechamber parser expects. When that mismatch is detected
+    we patch sqm.out and re-invoke antechamber with a no-op sqm shim so sqm
+    does not overwrite the patched file.
+    """
+    label = desc or "antechamber"
+    print(f"    → {label}: {' '.join(str(c) for c in cmd)}")
+    res = subprocess.run(
+        [str(c) for c in cmd],
+        cwd=str(cwd),
+        capture_output=True, text=True,
+    )
+    if res.returncode == 0:
+        return res.stdout
+
+    stderr_lower = (res.stderr or "").lower() + (res.stdout or "").lower()
+    sqm_out = cwd / "sqm.out"
+    if "mulliken" not in stderr_lower or not sqm_out.exists():
+        sys.exit(
+            f"\nERROR: {label} failed (exit {res.returncode})\n"
+            f"stdout (last 40 lines):\n"
+            + "\n".join((res.stdout or "").splitlines()[-40:])
+            + "\nstderr:\n"
+            + "\n".join((res.stderr or "").splitlines()[-20:])
+        )
+
+    if not _patch_sqm_out(sqm_out):
+        sys.exit(
+            f"\nERROR: {label} failed (exit {res.returncode}) and sqm.out "
+            f"could not be patched.\nstdout:\n"
+            + "\n".join((res.stdout or "").splitlines()[-40:])
+            + "\nstderr:\n"
+            + "\n".join((res.stderr or "").splitlines()[-20:])
+        )
+
+    print(f"    → sqm/antechamber version mismatch detected — patched sqm.out, retrying")
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        # Write a no-op sqm shim so antechamber won't re-run sqm
+        shim = Path(tmpdir) / "sqm"
+        shim.write_text("#!/bin/sh\n# no-op shim: sqm already ran\nexit 0\n")
+        shim.chmod(0o755)
+        env = {**os.environ, "PATH": f"{tmpdir}:{os.environ.get('PATH', '')}"}
+        res2 = subprocess.run(
+            [str(c) for c in cmd],
+            cwd=str(cwd),
+            capture_output=True, text=True,
+            env=env,
+        )
+
+    if res2.returncode != 0:
+        sys.exit(
+            f"\nERROR: {label} failed after sqm.out patch (exit {res2.returncode})\n"
+            f"stdout (last 40 lines):\n"
+            + "\n".join((res2.stdout or "").splitlines()[-40:])
+            + "\nstderr:\n"
+            + "\n".join((res2.stderr or "").splitlines()[-20:])
+        )
+    return res2.stdout
+
+
 def _infer_net_charge(pdb_path: Path) -> int:
     """Infer net formal charge from a ligand PDB using RDKit.
 
@@ -278,39 +374,40 @@ def parameterize_ligand(
     mult   = cfg["system"].get("multiplicity", 1)
     charge = _resolve_charge(pdb, cfg)
 
-    out_mol2 = work_dir / f"{resname}.mol2"
-    frcmod   = work_dir / f"{resname}.frcmod"
-    lib      = work_dir / f"{resname}.lib"
+    # Use absolute paths throughout so subprocess cwd never interferes
+    out_mol2 = (work_dir / f"{resname}.mol2").resolve()
+    frcmod   = (work_dir / f"{resname}.frcmod").resolve()
+    lib      = (work_dir / f"{resname}.lib").resolve()
 
-    _run(
+    _run_antechamber(
         ["antechamber",
          "-i",  str(pdb.resolve()), "-fi", "pdb",
          "-o",  str(out_mol2),      "-fo", "mol2",
          "-c",  method, "-s", "2",
          "-nc", str(charge), "-m", str(mult),
          "-rn", resname, "-at", gaff],
-        cwd=work_dir,
+        cwd=work_dir.resolve(),
         desc=f"antechamber ({resname})",
     )
     _run(
         ["parmchk2",
          "-i", str(out_mol2), "-f", "mol2",
          "-o", str(frcmod), "-s", gaff],
-        cwd=work_dir,
+        cwd=work_dir.resolve(),
         desc=f"parmchk2 ({resname})",
     )
     _check_frcmod(frcmod)
 
-    tleap_in = work_dir / "tleap_lib.in"
+    tleap_in = (work_dir / "tleap_lib.in").resolve()
     tleap_in.write_text(
         f"source {_FF_SOURCES.get(gaff, 'leaprc.' + gaff)}\n"
-        f"{resname} = loadmol2 {out_mol2.resolve()}\n"
+        f"{resname} = loadmol2 {out_mol2}\n"
         f"check {resname}\n"
-        f"loadamberparams {frcmod.resolve()}\n"
-        f"saveoff {resname} {lib.resolve()}\n"
+        f"loadamberparams {frcmod}\n"
+        f"saveoff {resname} {lib}\n"
         "quit\n"
     )
-    _run(["tleap", "-f", str(tleap_in.resolve())], cwd=work_dir,
+    _run(["tleap", "-f", str(tleap_in)], cwd=work_dir.resolve(),
          desc=f"tleap lib ({resname})")
 
     if not lib.exists():
@@ -554,15 +651,15 @@ def check_pdb(pdb: Path) -> None:
 # =============================================================================
 
 _FF_SOURCES: dict[str, str] = {
-    "ff14SB":         "leaprc.protein.ff14SB",
-    "ff19SB":         "leaprc.protein.ff19SB",
-    "gaff":           "leaprc.gaff",
-    "gaff2":          "leaprc.gaff2",
-    "tip3p":          "leaprc.water.tip3p",
-    "tip4pew":        "leaprc.water.tip4pew",
-    "opc":            "leaprc.water.opc",
-    "ionsjc_tip3p":   "leaprc.water.ionsjc_tip3p",
-    "ionsjc_tip4pew": "leaprc.water.ionsjc_tip4pew",
+    "ff14SB":  "leaprc.protein.ff14SB",
+    "ff19SB":  "leaprc.protein.ff19SB",
+    "gaff":    "leaprc.gaff",
+    "gaff2":   "leaprc.gaff2",
+    "tip3p":   "leaprc.water.tip3p",
+    "tip4pew": "leaprc.water.tip4pew",
+    "opc":     "leaprc.water.opc",
+    # Note: ion parameters (ionsjc_tip3p etc.) are loaded automatically
+    # by the water leaprc — there is no separate leaprc.water.ionsjc_* file.
 }
 
 _BOX_NAME: dict[str, str] = {
@@ -658,7 +755,7 @@ def build_system(
 
     sources = [
         f"source {_ff_source(key, val)}"
-        for key in ("protein", "ligand", "water", "ions")
+        for key in ("protein", "ligand", "water")
         for val in [ff.get(key)]
         if val
     ]

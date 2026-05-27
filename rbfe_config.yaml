@@ -46,13 +46,13 @@ ligands:
   old:
     pdb: structures/ING.pdb    # path relative to this config file
     name: ING               # ≤ 4 characters
-    lib:    parameters/ING/ING.lib      # optional — used with --skip-param
-    frcmod: parameters/ING/ING.frcmod   # optional — used with --skip-param
+#    lib:    parameters/ING/ING.lib      # optional — used with --skip-param
+#    frcmod: parameters/ING/ING.frcmod   # optional — used with --skip-param
   new:
     pdb: structures/INI.pdb
     name: INI
-    lib:    parameters/INI/INI.lib      # optional — used with --skip-param
-    frcmod: parameters/INI/INI.frcmod   # optional — used with --skip-param
+#    lib:    parameters/INI/INI.lib      # optional — used with --skip-param
+#    frcmod: parameters/INI/INI.frcmod   # optional — used with --skip-param
 
 
 # -----------------------------------------------------------------------------
@@ -73,7 +73,7 @@ forcefield:
   protein: ff14SB          # ff14SB | ff19SB
   ligand:  gaff2           # gaff   | gaff2
   water:   tip3p           # tip3p  | tip4pew | opc
-#  ions:    ionsjc_tip3p    # ionsjc_tip3p | ionsjc_tip4pew
+#  ions:    ionsjc_tip3p    # loaded automatically by leaprc.water.tip3p
 
 
 # -----------------------------------------------------------------------------
@@ -120,7 +120,7 @@ slurm:
     ntasks:    1
     gres:      gpu:1
     partition: gpu
-    account: ACCOUNTNAME
+    account:   YOUR_ACCOUNT
 
 
 # -----------------------------------------------------------------------------
