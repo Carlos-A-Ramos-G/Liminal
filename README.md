@@ -1,6 +1,8 @@
-# rbfe
+# Liminal
 
-AmberTools-native Relative Binding Free Energy (RBFE) workflow. Automates the full pipeline from ligand PDB files and a protein structure to production-ready AMBER TI input files, with automatic atom mapping, soft-core mask derivation, and optional MBAR analysis.
+Between states. Between ligands. Between 0 and 1.
+
+AmberTools-native Relative Binding Free Energy (RBFE) workflow. Drop your ligand and protein PDBs — Liminal handles parameterization, atom mapping, system building, and TI/MBAR analysis end-to-end.
 
 ## Requirements
 
