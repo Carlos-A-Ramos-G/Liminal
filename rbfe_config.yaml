@@ -49,10 +49,10 @@ mbar: true
 #     parameters/{name}/{name}.frcmod
 ligands:
   old:
-    pdb:  structures/LIG1.pdb   # path relative to this config file
+ #    pdb:  structures/LIG1.pdb   # path relative to this config file
     # name: LIG1                 # optional — derived from filename if omitted
   new:
-    pdb:  structures/LIG2.pdb
+  #   pdb:  structures/LIG2.pdb
     # name: LIG2
 
 

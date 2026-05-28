@@ -137,17 +137,17 @@ execution_command:
 simulation:
 
   min:
-    maxcyc: 1000000     # maximum steepest-descent / conjugate-gradient steps
+    maxcyc: 100000      # maximum steepest-descent / conjugate-gradient steps
     ntpr:   5000        # energy print frequency (steps)
 
   heating:
-    nstlim: 500000     # total steps  → 1 ns  at dt = 0.001 ps
+    nstlim: 500000      # total steps  → 500 ps  at dt = 0.001 ps
     dt:     0.001       # time step (ps)
     ntwx:   10000       # trajectory / energy write frequency (steps)
     tempi:  10.0        # initial temperature (K); target is top-level temperature
 
   equil:
-    nstlim: 500000     # total steps  → 1 ns  at dt = 0.001 ps
+    nstlim: 1000000     # total steps  → 1 ns  at dt = 0.001 ps
     dt:     0.001
     ntwx:   100000      # coordinate write frequency (steps)
 
