@@ -30,6 +30,7 @@ parameters/*/*.mol2
 __pycache__/
 *.pyc
 *.pyo
+*.egg-info/
 
 # Network visualization
 network.html

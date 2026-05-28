@@ -18,7 +18,7 @@ conda activate AmberTools25
 ## Package layout
 
 ```
-rbfe/
+liminal/
 ├── __init__.py       package marker
 ├── __main__.py       CLI entry point (argparse dispatch)
 ├── utils.py          subprocess helpers, PDB I/O, filesystem utilities
@@ -38,7 +38,7 @@ Both invocation styles are equivalent:
 
 ```bash
 python rbfe_runner.py --config my.yaml prepare   # original style
-python -m rbfe       --config my.yaml prepare   # package style
+python -m liminal       --config my.yaml prepare   # package style
 ```
 
 ---
@@ -75,21 +75,21 @@ network → network-submit → network-analyse
 
 ```bash
 # Full preparation (antechamber + mapping + tleap + input files)
-python -m rbfe --config rbfe_config.yaml prepare
+python -m liminal --config rbfe_config.yaml prepare
 
 # Skip parameterisation if lib/frcmod already exist in parameters/{name}/
-python -m rbfe --config rbfe_config.yaml prepare --skip-param
+python -m liminal --config rbfe_config.yaml prepare --skip-param
 
 # Dry run: validate config and show atom mapping without writing any files
-python -m rbfe --config rbfe_config.yaml prepare --dry-run
+python -m liminal --config rbfe_config.yaml prepare --dry-run
 
 # Use a manually edited atom mapping instead of running MCS
-python -m rbfe --config rbfe_config.yaml prepare --override-mapping ING_to_INI/prep/mapping.json
+python -m liminal --config rbfe_config.yaml prepare --override-mapping ING_to_INI/prep/mapping.json
 
 # Choose submission mode (affects the generated job scripts)
-python -m rbfe --config rbfe_config.yaml prepare --mode serial    # default
-python -m rbfe --config rbfe_config.yaml prepare --mode parallel  # windows run in parallel
-python -m rbfe --config rbfe_config.yaml prepare --mode local     # no SLURM, sequential script
+python -m liminal --config rbfe_config.yaml prepare --mode serial    # default
+python -m liminal --config rbfe_config.yaml prepare --mode parallel  # windows run in parallel
+python -m liminal --config rbfe_config.yaml prepare --mode local     # no SLURM, sequential script
 ```
 
 Preparation creates the following structure:
@@ -135,21 +135,21 @@ parameters/
 
 ```bash
 # Submit via SLURM (serial or parallel window submission)
-python -m rbfe --config rbfe_config.yaml submit
-python -m rbfe --config rbfe_config.yaml submit --mode parallel
+python -m liminal --config rbfe_config.yaml submit
+python -m liminal --config rbfe_config.yaml submit --mode parallel
 
 # Run locally in the background (no SLURM required)
-python -m rbfe --config rbfe_config.yaml submit --mode local
+python -m liminal --config rbfe_config.yaml submit --mode local
 ```
 
 ### 3. Analyse
 
 ```bash
 # TI (Gauss-Legendre) + MBAR analysis using last 4000 dV/dλ records per window
-python -m rbfe --config rbfe_config.yaml analyse
+python -m liminal --config rbfe_config.yaml analyse
 
 # Use a different number of records (e.g. last 2000 for a shorter run)
-python -m rbfe --config rbfe_config.yaml analyse --tail 2000
+python -m liminal --config rbfe_config.yaml analyse --tail 2000
 ```
 
 Output:
@@ -187,10 +187,10 @@ Output:
 Place all ligand PDB files (with explicit H) in `structures/` alongside the protein PDB.
 
 ```bash
-python -m rbfe --config rbfe_config.yaml network
-python -m rbfe --config rbfe_config.yaml network --dry-run       # preview only
-python -m rbfe --config rbfe_config.yaml network --skip-param    # reuse existing parameters
-python -m rbfe --config rbfe_config.yaml network --structures-dir path/to/pdbs
+python -m liminal --config rbfe_config.yaml network
+python -m liminal --config rbfe_config.yaml network --dry-run       # preview only
+python -m liminal --config rbfe_config.yaml network --skip-param    # reuse existing parameters
+python -m liminal --config rbfe_config.yaml network --structures-dir path/to/pdbs
 ```
 
 This discovers all `.pdb` files (excluding `protein.pdb`), computes a minimum spanning tree using Morgan-Tanimoto similarity, parameterises each ligand exactly once, and runs the full prepare pipeline for every edge. A `network.json` file is written with the full graph definition.
@@ -213,13 +213,13 @@ The ASCII tree printed during preparation shows the MST structure and wave order
 ```bash
 # Branch-aware submission (default): each edge waits for its parent edge to finish.
 # A failed branch stops only its downstream transformations; sibling branches continue.
-python -m rbfe --config rbfe_config.yaml network-submit
+python -m liminal --config rbfe_config.yaml network-submit
 
 # Submit all equilibration jobs immediately with no inter-transformation dependencies
-python -m rbfe --config rbfe_config.yaml network-submit --mode parallel
+python -m liminal --config rbfe_config.yaml network-submit --mode parallel
 
 # Run sequentially in the foreground (for local testing)
-python -m rbfe --config rbfe_config.yaml network-submit --mode local
+python -m liminal --config rbfe_config.yaml network-submit --mode local
 ```
 
 The branch-aware mode groups submissions by wave depth and applies SLURM `--dependency=afterok` so that:
@@ -231,8 +231,8 @@ The branch-aware mode groups submissions by wave depth and applies SLURM `--depe
 ### 3. Analyse the network
 
 ```bash
-python -m rbfe --config rbfe_config.yaml network-analyse
-python -m rbfe --config rbfe_config.yaml network-analyse --tail 2000
+python -m liminal --config rbfe_config.yaml network-analyse
+python -m liminal --config rbfe_config.yaml network-analyse --tail 2000
 ```
 
 Prints a ΔΔG summary table across all MST edges:
@@ -252,15 +252,15 @@ Prints a ΔΔG summary table across all MST edges:
 
 ```bash
 # Generate interactive HTML from an existing network.json
-python -m rbfe --config rbfe_config.yaml network-visualize
+python -m liminal --config rbfe_config.yaml network-visualize
 
 # Custom input/output paths
-python -m rbfe --config rbfe_config.yaml network-visualize \
+python -m liminal --config rbfe_config.yaml network-visualize \
     --network network.json \
     --output  network.html
 
 # Build network on-the-fly (no network.json needed)
-python -m rbfe --config rbfe_config.yaml network-visualize \
+python -m liminal --config rbfe_config.yaml network-visualize \
     --structures-dir structures/
 ```
 
@@ -338,15 +338,15 @@ If `{NAME}.pdb` is absent but the `.lib` and `.frcmod` are present, it is create
 
 ```bash
 # 1. Run a dry-run to see the auto mapping
-python -m rbfe --config rbfe_config.yaml prepare --dry-run
+python -m liminal --config rbfe_config.yaml prepare --dry-run
 
 # 2. Run prepare once to write the mapping file (no dry-run)
-python -m rbfe --config rbfe_config.yaml prepare
+python -m liminal --config rbfe_config.yaml prepare
 
 # 3. Edit prep/mapping.json to correct any mismatched atoms
 
 # 4. Re-run prepare with the override
-python -m rbfe --config rbfe_config.yaml prepare \
+python -m liminal --config rbfe_config.yaml prepare \
     --override-mapping ING_to_INI/prep/mapping.json
 ```
 

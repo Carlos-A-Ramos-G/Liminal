@@ -1,4 +1,4 @@
-"""CLI entry point — python -m rbfe <command> [options]"""
+"""CLI entry point — python -m liminal <command> [options]"""
 
 import json
 import sys

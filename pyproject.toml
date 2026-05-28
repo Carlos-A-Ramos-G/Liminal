@@ -1,0 +1,42 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "liminal-rbfe"
+version = "1.0.0"
+description = "Between states. Between ligands. Between 0 and 1."
+readme = "README.md"
+license = { file = "LICENSE" }
+authors = [{ name = "Carlos A. Ramos-G", email = "aramosguzmanc@gmail.com" }]
+requires-python = ">=3.10"
+keywords = ["free energy", "RBFE", "AMBER", "TI", "MBAR", "drug discovery", "alchemical"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Chemistry",
+    "Topic :: Scientific/Engineering :: Bio-Informatics",
+]
+
+# AmberTools must be installed via conda (not available on PyPI).
+# Recommended environment:
+#   conda create -n liminal -c conda-forge ambertools rdkit pyyaml pymbar
+dependencies = [
+    "rdkit>=2023.3",
+    "PyYAML>=6.0",
+]
+
+[project.optional-dependencies]
+mbar = ["pymbar>=4.0"]
+
+[project.scripts]
+liminal = "liminal.__main__:main"
+
+[project.urls]
+Homepage = "https://github.com/Carlos-A-Ramos-G/Liminal"
+Repository = "https://github.com/Carlos-A-Ramos-G/Liminal"
+
+[tool.setuptools.packages.find]
+include = ["liminal*"]
