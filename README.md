@@ -4,6 +4,32 @@ Between states. Between ligands. Between 0 and 1.
 
 AmberTools-native Relative Binding Free Energy (RBFE) workflow. Drop your ligand and protein PDBs — Liminal handles parameterization, atom mapping, system building, and TI/MBAR analysis end-to-end.
 
+## Installation
+
+Install Liminal into your AmberTools conda environment:
+
+```bash
+conda activate AmberTools25   # or whatever your AmberTools environment is named
+conda install -c conda-forge rdkit pyyaml pymbar
+pip install liminal-rbfe
+```
+
+Or install directly from the repository:
+
+```bash
+pip install git+https://github.com/Carlos-A-Ramos-G/Liminal.git
+```
+
+For development:
+
+```bash
+git clone https://github.com/Carlos-A-Ramos-G/Liminal.git
+cd Liminal
+pip install -e .
+```
+
+---
+
 ## Requirements
 
 ```bash
@@ -31,7 +57,7 @@ liminal/
 ├── commands.py       single-pair workflow (prepare, submit, analyse)
 ├── network.py        perturbation network MST, high-throughput workflow
 └── visualize.py      interactive HTML tree visualization
-rbfe_runner.py        thin shim — delegates to the package (backward-compatible)
+rbfe_runner.py        legacy entry point — kept for backward compatibility, delegates all calls to the liminal package
 ```
 
 Both invocation styles are equivalent:
